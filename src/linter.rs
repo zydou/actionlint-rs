@@ -2,11 +2,12 @@
 //!
 //! Rust counterpart of the original `linter.go`. The [`Linter`] manages the entire linting
 //! lifecycle: it locates the project, reads workflow files, parses them, runs the rules through a
-//! [`Visitor`](crate::pass::Visitor), and collects the resulting errors.
+//! [`Visitor`](crate::pass::Visitor), filters the resulting errors, and writes them to the output.
 
 use std::path::{Path, PathBuf};
 
-use crate::error::Error;
+use crate::config::{Config, IgnorePatterns};
+use crate::error::{Error, ErrorFormatter};
 
 /// Options controlling the behavior of the [`Linter`].
 ///
@@ -36,24 +37,71 @@ pub struct LinterOptions {
 }
 
 /// Lints GitHub Actions workflow files.
-#[derive(Debug)]
-pub struct Linter {
-    #[allow(dead_code)]
+///
+/// The lifetime `'a` borrows the writer that errors are printed to, so the caller keeps ownership
+/// of the stream (mirroring the original `Linter` holding an `io.Writer`).
+pub struct Linter<'a> {
+    out: &'a mut dyn std::io::Write,
     opts: LinterOptions,
     /// The name used for stdin input in error messages.
     stdin_name: String,
+    /// Compiled `--ignore` patterns. Errors whose messages match any pattern are dropped.
+    ignore_pats: IgnorePatterns,
+    /// Config loaded from the `-config-file` option. Takes priority over the repository config.
+    default_config: Option<Config>,
+    /// Template formatter for the `--format` option. When `None`, errors are pretty-printed.
+    err_fmt: Option<ErrorFormatter>,
 }
 
-impl Linter {
+impl<'a> Linter<'a> {
     /// Creates a new `Linter` writing errors to `out` and configured with `opts`.
-    pub fn new(out: Box<dyn std::io::Write>, opts: LinterOptions) -> Result<Self, String> {
+    ///
+    /// Returns an error when an `--ignore` pattern is not a valid regular expression, the
+    /// `-config-file` cannot be read/parsed, or the `--format` template is invalid.
+    pub fn new(out: &'a mut dyn std::io::Write, opts: LinterOptions) -> Result<Self, String> {
+        // Honor the explicit color choice; leave the `colored` crate to auto-detect from the
+        // environment (`NO_COLOR`, tty) when no option is given.
+        match opts.color {
+            Some(false) => colored::control::set_override(false),
+            Some(true) => colored::control::set_override(true),
+            None => colored::control::unset_override(),
+        }
+
         let stdin_name = if opts.stdin_file_name.is_empty() {
             "<stdin>".to_string()
         } else {
             opts.stdin_file_name.clone()
         };
-        let _ = out;
-        Ok(Self { opts, stdin_name })
+
+        let mut pats = Vec::with_capacity(opts.ignore_patterns.len());
+        for s in &opts.ignore_patterns {
+            let r = regex::Regex::new(s)
+                .map_err(|e| format!("invalid regular expression for ignore pattern {s:?}: {e}"))?;
+            pats.push(r);
+        }
+
+        let default_config = if opts.config_file.is_empty() {
+            None
+        } else {
+            Some(crate::config::read_config_file(Path::new(
+                &opts.config_file,
+            ))?)
+        };
+
+        let err_fmt = if opts.format.is_empty() {
+            None
+        } else {
+            Some(ErrorFormatter::new(&opts.format)?)
+        };
+
+        Ok(Self {
+            out,
+            opts,
+            stdin_name,
+            ignore_pats: IgnorePatterns(pats),
+            default_config,
+            err_fmt,
+        })
     }
 
     /// Lints the workflow content read from stdin.
@@ -80,11 +128,11 @@ impl Linter {
         self.lint_dir(&workflows, Some(project))
     }
 
-    /// Lints all YAML workflow files in the given directory recursively.
+    /// Lints all YAML workflow files in the given directory.
     pub fn lint_dir(
         &mut self,
         dir: &Path,
-        _project: Option<crate::project::Project>,
+        project: Option<crate::project::Project>,
     ) -> Result<Vec<Error>, String> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| format!("could not read files in {}: {e}", dir.display()))?
@@ -99,26 +147,51 @@ impl Linter {
         if files.is_empty() {
             return Err(format!("no YAML file was found in {}", dir.display()));
         }
-        self.lint_files(&files)
+        self.lint_files(&files, project)
     }
 
-    /// Lints the given YAML workflow files.
-    pub fn lint_files(&mut self, paths: &[PathBuf]) -> Result<Vec<Error>, String> {
+    /// Lints the given YAML workflow files, printing each file's errors as they are checked.
+    pub fn lint_files(
+        &mut self,
+        paths: &[PathBuf],
+        project: Option<crate::project::Project>,
+    ) -> Result<Vec<Error>, String> {
         let mut all = Vec::new();
+        // In `--format` mode all errors are rendered through a single template invocation, so the
+        // template fields are accumulated across files and printed once at the end (matching the
+        // original `LintFiles`).
+        let mut fields = Vec::new();
+
         for p in paths {
-            let project = crate::project::find_project(p)?;
+            let project = match &project {
+                Some(pr) => crate::project::find_project(p)?.or(Some(pr.clone())),
+                None => crate::project::find_project(p)?,
+            };
             let content =
                 std::fs::read(p).map_err(|e| format!("could not read {}: {e}", p.display()))?;
             let path_str = p.to_string_lossy().into_owned();
-            let mut errs = self.lint(&path_str, &content, project)?;
-            all.append(&mut errs);
+            let errs = self.check(&path_str, &content, project.as_ref())?;
+
+            if self.err_fmt.is_some() {
+                fields.extend(errs.iter().map(|e| e.template_fields(&content)));
+            } else {
+                let src = if self.opts.oneline { &[][..] } else { &content[..] };
+                for e in &errs {
+                    e.pretty_print(&mut *self.out, src);
+                }
+            }
+            all.extend(errs);
         }
-        all.sort_by(crate::error::compare_errors);
-        all.dedup_by(|a, b| crate::error::equals_errors(a, b));
+
+        if let Some(fmt) = &self.err_fmt {
+            fmt.print(&mut *self.out, &fields)?;
+        }
+
         Ok(all)
     }
 
     /// Lints the given workflow content. The `path` is used as the file path in error messages.
+    /// Errors are printed to the output writer and also returned.
     ///
     /// When `project` is `None`, it is detected from the path.
     pub fn lint(
@@ -132,12 +205,45 @@ impl Linter {
             None => crate::project::find_project(Path::new(path))?,
         };
 
+        let errs = self.check(path, content, project.as_ref())?;
+
+        if let Some(fmt) = &self.err_fmt {
+            let fields: Vec<_> = errs.iter().map(|e| e.template_fields(content)).collect();
+            fmt.print(&mut *self.out, &fields)?;
+        } else {
+            let src = if self.opts.oneline { &[][..] } else { content };
+            for e in &errs {
+                e.pretty_print(&mut *self.out, src);
+            }
+        }
+
+        Ok(errs)
+    }
+
+    /// The core of the linting pipeline: parse the content, run the rules, filter the resulting
+    /// errors, and normalize them (populate the file path, sort, dedup). Does not print.
+    ///
+    /// This is the counterpart of the `check` method in the original `Linter`.
+    fn check(
+        &mut self,
+        path: &str,
+        content: &[u8],
+        project: Option<&crate::project::Project>,
+    ) -> Result<Vec<Error>, String> {
+        // `-config-file` has higher priority than the repository config file.
+        let config = match &self.default_config {
+            Some(c) => Some(c.clone()),
+            None => project.and_then(|p| p.config().cloned()),
+        };
+
         let (workflow, mut all) = crate::parse::parse(content);
 
         if let Some(w) = workflow {
-            let errs = crate::linter::run_rules(&w, path, project.as_ref(), &self.opts)?;
+            let errs = crate::linter::run_rules(&w, path, project, config.as_ref(), &self.opts)?;
             all.extend(errs);
         }
+
+        all = self.filter_errors(all, config.as_ref(), path);
 
         for err in &mut all {
             err.filepath = path.to_string();
@@ -147,16 +253,41 @@ impl Linter {
         all.dedup_by(|a, b| crate::error::equals_errors(a, b));
         Ok(all)
     }
+
+    /// Drops errors matched by the `--ignore` option or the `ignore` key of a matching `paths`
+    /// entry in the config file. Counterpart of `filterErrors`.
+    fn filter_errors(
+        &self,
+        mut errs: Vec<Error>,
+        config: Option<&Config>,
+        path: &str,
+    ) -> Vec<Error> {
+        let path_cfgs = config.map(|c| c.path_configs(path)).unwrap_or_default();
+        if self.ignore_pats.0.is_empty() && path_cfgs.is_empty() {
+            return errs;
+        }
+
+        errs.retain(|e| {
+            if self.ignore_pats.matches(&e.message) {
+                return false;
+            }
+            !path_cfgs
+                .iter()
+                .any(|pc| pc.ignore.matches(&e.message))
+        });
+        errs
+    }
 }
 
 /// Runs all rules against the parsed workflow, returning the errors found by the rules (not
-/// including syntax errors).
+/// including syntax errors). Each rule is given the resolved config via [`Rule::set_config`].
 ///
-/// This is the counterpart of the `check` method in the original `Linter`.
+/// This is the counterpart of the `check` method's rule-running portion in the original `Linter`.
 pub fn run_rules(
     workflow: &crate::ast::Workflow,
     path: &str,
     project: Option<&crate::project::Project>,
+    config: Option<&Config>,
     opts: &LinterOptions,
 ) -> Result<Vec<Error>, String> {
     let mut visitor = crate::pass::Visitor::new();
@@ -211,6 +342,13 @@ pub fn run_rules(
         && let Ok(r) = crate::rule_pyflakes::RulePyflakes::new(&opts.pyflakes)
     {
         rules.push(Box::new(r));
+    }
+
+    // Populate each rule's config (self-hosted runner labels, config variables, ...).
+    if let Some(cfg) = config {
+        for r in &mut rules {
+            r.set_config(cfg.clone());
+        }
     }
 
     for r in &mut rules {

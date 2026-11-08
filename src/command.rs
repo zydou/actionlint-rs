@@ -22,33 +22,6 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Options controlling the behavior of the linter, gathered from command line flags.
-///
-/// This mirrors the original `LinterOptions`.
-#[derive(Debug, Clone, Default)]
-pub struct LinterOptions {
-    /// Enable verbose log output.
-    pub verbose: bool,
-    /// Enable debug log output.
-    pub debug: bool,
-    /// Colorize error output: `None` means auto, `Some(true)` always, `Some(false)` never.
-    pub color: Option<bool>,
-    /// Emit one line per error.
-    pub oneline: bool,
-    /// Executable for running the `shellcheck` external command. Empty disables the integration.
-    pub shellcheck: String,
-    /// Executable for running the `pyflakes` external command. Empty disables the integration.
-    pub pyflakes: String,
-    /// Regular expressions to filter errors by matching their messages.
-    pub ignore_patterns: Vec<String>,
-    /// Path to a config file. Empty means actionlint tries to read `.github/actionlint.yaml`.
-    pub config_file: String,
-    /// Custom Go template to format error messages.
-    pub format: String,
-    /// File name used when reading input from stdin.
-    pub stdin_file_name: String,
-}
-
 /// Represents the entire actionlint command. The given handles are used for input/output.
 pub struct Command {
     stdout: Box<dyn Write>,
@@ -140,11 +113,12 @@ impl Command {
             stdin_file_name: cli.stdin_filename.clone(),
         };
 
-        let mut linter =
-            crate::linter::Linter::new(Box::new(std::io::sink()), opts).map_err(|e| {
-                let _ = writeln!(self.stderr, "{e}");
-                EXIT_STATUS_FAILURE
-            })?;
+        // The `Linter` borrows this command's stdout for its lifetime, so error output keeps
+        // flowing to the same stream the process was given.
+        let mut linter = crate::linter::Linter::new(&mut *self.stdout, opts).map_err(|e| {
+            let _ = writeln!(self.stderr, "{e}");
+            EXIT_STATUS_FAILURE
+        })?;
 
         let result = if cli.args.len() == 1 && cli.args[0] == "-" {
             let mut buf = String::new();
@@ -157,7 +131,7 @@ impl Command {
             linter.lint_repository("")
         } else {
             let paths: Vec<PathBuf> = cli.args.iter().map(PathBuf::from).collect();
-            linter.lint_files(&paths)
+            linter.lint_files(&paths, None)
         };
 
         match result {
