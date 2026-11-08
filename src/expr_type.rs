@@ -49,6 +49,11 @@ impl ExprTypeKind {
     pub fn inner(&self) -> &ExprTypeKindInner {
         &self.0
     }
+
+    /// Returns a mutable reference to the inner type, cloning it first if it is shared.
+    pub fn inner_mut(&mut self) -> &mut ExprTypeKindInner {
+        Arc::make_mut(&mut self.0)
+    }
 }
 
 impl fmt::Display for ExprTypeKind {

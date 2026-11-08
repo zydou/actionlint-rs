@@ -2,12 +2,6 @@
 //!
 //! Checks: Checks for popular actions released on GitHub, local actions, and action calls at
 //! `uses:`. Rust counterpart of the original `rule_action.go`.
-//!
-//! Note: the local-action `runs` subtype checks (Docker/Composite/JavaScript) are only partially
-//! ported because the Rust [`crate::action_metadata::ActionMetadataRuns`] currently models just
-//! `using`, `main`, and `image`. The checks that require the missing fields (`pre`, `pre-if`,
-//! `post`, `post-if`, `steps`, `pre-entrypoint`, `entrypoint`, `post-entrypoint`, `args`, `env`)
-//! are skipped with inline comments until those fields are added to the metadata struct.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -355,6 +349,14 @@ impl RuleAction {
             return;
         };
 
+        // A step with no `uses:` key (e.g. only `with:`, or an otherwise malformed step) parses to
+        // an empty `uses` value here. The original implementation models a missing `uses` as a nil
+        // pointer and skips it in `VisitStep`; mirror that by skipping empty specs so the action
+        // rule stays silent and the missing `uses`/`run` is left to the syntax check.
+        if e.uses.as_str().is_empty() {
+            return;
+        }
+
         if e.uses.contains_expression() {
             // Cannot parse specification made with interpolation. Give up.
             return;
@@ -453,9 +455,6 @@ impl RuleAction {
     }
 
     /// Reports `props` that are not allowed in the `runs` section for the given action type.
-    ///
-    /// Only the `main` and `image` properties can be validated because the Rust
-    /// [`ActionMetadataRuns`] does not yet model the other `runs` properties.
     fn check_invalid_runs_props(
         &mut self,
         pos: Pos,
@@ -466,13 +465,24 @@ impl RuleAction {
         props: &[&str],
     ) {
         for prop in props {
-            // Only `main` and `image` have corresponding fields on the Rust runs struct.
             let invalid = match *prop {
                 "main" => !r.main.is_empty(),
+                "pre" => !r.pre.is_empty(),
+                "pre-if" => !r.pre_if.is_empty(),
+                "post" => !r.post.is_empty(),
+                "post-if" => !r.post_if.is_empty(),
+                "steps" => !r.steps.is_empty(),
                 "image" => !r.image.is_empty(),
-                // TODO: Validate `pre`, `pre-if`, `post`, `post-if`, `steps`,
-                // `pre-entrypoint`, `entrypoint`, `post-entrypoint`, `args`, and `env` once
-                // `ActionMetadataRuns` models these fields.
+                "pre-entrypoint" => !r.pre_entrypoint.is_empty(),
+                "entrypoint" => !r.entrypoint.is_empty(),
+                "post-entrypoint" => !r.post_entrypoint.is_empty(),
+                // Note: Go checks `r.Args != nil` (presence, not emptiness). Since an empty
+                // `args:` key deserializes to an empty vec in both cases, length is equivalent
+                // here.
+                "args" => !r.args.is_empty(),
+                // Note: Go checks `r.Env != nil` (presence). A present-but-empty `env:` map is
+                // indistinguishable from an absent one after deserialization.
+                "env" => !r.env.is_empty(),
                 _ => false,
             };
 
@@ -496,8 +506,8 @@ impl RuleAction {
             self.base.error_at(
                 pos,
                 format!(
-                    "file {file:?} does not exist in {}. it is specified at {prop:?} key in \"runs\" section in {name:?} action",
-                    dir.display()
+                    "file {file:?} does not exist in \"{dir}\". it is specified at {prop:?} key in \"runs\" section in {name:?} action",
+                    dir = dir.display()
                 ),
             );
         }
@@ -524,15 +534,16 @@ impl RuleAction {
                 self.base.error_at(
                     pos,
                     format!(
-                        "the local file {:?} referenced from \"image\" key must be named \"Dockerfile\" in {name:?} action. the action is defined at {}",
+                        "the local file {:?} referenced from \"image\" key must be named \"Dockerfile\" in {name:?} action. the action is defined at \"{dir}\"",
                         r.image,
-                        dir.display()
+                        dir = dir.display()
                     ),
                 );
             }
         }
-        // TODO: Validate `pre-entrypoint`, `entrypoint`, and `post-entrypoint` files once
-        // `ActionMetadataRuns` models these fields.
+        self.check_runs_file_exists(&r.pre_entrypoint, dir, "pre-entrypoint", name, pos);
+        self.check_runs_file_exists(&r.entrypoint, dir, "entrypoint", name, pos);
+        self.check_runs_file_exists(&r.post_entrypoint, dir, "post-entrypoint", name, pos);
         self.check_invalid_runs_props(
             pos,
             r,
@@ -553,7 +564,9 @@ impl RuleAction {
         name: &str,
         pos: Pos,
     ) {
-        // TODO: Report a missing `steps` property once `ActionMetadataRuns` models it.
+        if r.steps.is_empty() {
+            self.missing_runs_prop(pos, "steps", "Composite", name, &dir.to_string_lossy());
+        }
         self.check_invalid_runs_props(
             pos,
             r,
@@ -592,8 +605,27 @@ impl RuleAction {
             self.check_runs_file_exists(&r.main, dir, "main", name, pos);
         }
 
-        // TODO: Validate the `pre`/`pre-if` and `post`/`post-if` relationships once
-        // `ActionMetadataRuns` models these fields.
+        self.check_runs_file_exists(&r.pre, dir, "pre", name, pos);
+        if r.pre.is_empty() && !r.pre_if.is_empty() {
+            self.base.error_at(
+                pos,
+                format!(
+                    "\"pre\" is required when \"pre-if\" is specified in \"runs\" section in {name:?} action. the action is defined at \"{dir}\"",
+                    dir = dir.display()
+                ),
+            );
+        }
+
+        self.check_runs_file_exists(&r.post, dir, "post", name, pos);
+        if r.post.is_empty() && !r.post_if.is_empty() {
+            self.base.error_at(
+                pos,
+                format!(
+                    "\"post\" is required when \"post-if\" is specified in \"runs\" section in {name:?} action. the action is defined at \"{dir}\"",
+                    dir = dir.display()
+                ),
+            );
+        }
 
         self.check_invalid_runs_props(
             pos,
@@ -619,7 +651,7 @@ impl RuleAction {
                 self.base.error_at(
                     pos,
                     format!(
-                        "input {:?} is deprecated but \"deprecationMessage\" is empty in metadata of {:?} action at {}",
+                        "input {:?} is deprecated but \"deprecationMessage\" is empty in metadata of {:?} action at \"{}\"",
                         i.name, meta.name, meta.path().display()
                     ),
                 );
@@ -636,9 +668,9 @@ impl RuleAction {
             "" => self.base.error_at(
                 pos,
                 format!(
-                    "\"runs.using\" is missing in local action {:?} defined at {}",
+                    "\"runs.using\" is missing in local action {:?} defined at \"{dir}\"",
                     meta.name,
-                    meta.dir().display()
+                    dir = meta.dir().display()
                 ),
             ),
             "docker" => {
@@ -654,8 +686,8 @@ impl RuleAction {
                 self.base.error_at(
                     pos,
                     format!(
-                        "invalid runner name {:?} at runs.using in {:?} action defined at {}. valid runners are \"composite\", \"docker\", \"node20\", and \"node24\". see https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#runs",
-                        r.using, meta.name, meta.dir().display()
+                        "invalid runner name {:?} at runs.using in {:?} action defined at \"{dir}\". valid runners are \"composite\", \"docker\", \"node20\", and \"node24\". see https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#runs",
+                        r.using, meta.name, dir = meta.dir().display()
                     ),
                 );
 
@@ -711,14 +743,14 @@ impl RuleAction {
         if meta.name.is_empty() {
             self.base.error_at(
                 pos,
-                format!("name is required in action metadata {}", path.display()),
+                format!("name is required in action metadata \"{}\"", path.display()),
             );
         }
         if meta.description.is_empty() {
             self.base.error_at(
                 pos,
                 format!(
-                    "description is required in metadata of {:?} action at {}",
+                    "description is required in metadata of {:?} action at \"{}\"",
                     meta.name,
                     path.display()
                 ),
@@ -730,7 +762,7 @@ impl RuleAction {
             self.base.error_at(
                 pos,
                 format!(
-                    "incorrect icon name {:?} at branding.icon in metadata of {:?} action at {}. see the official document to know the exhaustive list of supported icons: https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#brandingicon",
+                    "incorrect icon name {:?} at branding.icon in metadata of {:?} action at \"{}\". see the official document to know the exhaustive list of supported icons: https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#brandingicon",
                     meta.branding.icon, meta.name, path.display()
                 ),
             );
@@ -741,7 +773,7 @@ impl RuleAction {
             self.base.error_at(
                 pos,
                 format!(
-                    "incorrect color {:?} at branding.icon in metadata of {:?} action at {}. see the official document to know the exhaustive list of supported colors: https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#brandingcolor",
+                    "incorrect color {:?} at branding.icon in metadata of {:?} action at \"{}\". see the official document to know the exhaustive list of supported colors: https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#brandingcolor",
                     meta.branding.color, meta.name, path.display()
                 ),
             );
@@ -1169,12 +1201,13 @@ branding:
   color: "green"
 runs:
   using: composite
+  steps:
+    - run: echo hi
 "#;
         let (cache, root) = local_action_cache("good_meta", contents);
         let mut r = RuleAction::new(cache);
         r.visit_step(&action_step("./my-action", &[])).unwrap();
         let errs = r.take_errors();
-        // `composite` runs with no `main`/`image` produce no runs errors in this port.
         assert!(errs.is_empty(), "{errs:?}");
         let _ = std::fs::remove_dir_all(&root);
     }

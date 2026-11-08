@@ -5,7 +5,7 @@
 //! available values.
 
 /// Returns the string quoted Go-style (double quotes with escapes), matching `strconv.Quote`.
-fn quote(s: &str) -> String {
+pub fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

@@ -11,7 +11,7 @@ use crate::ast::{
     Event, Pos, String, WebhookEvent, WebhookEventFilter, Workflow, WorkflowCallEvent,
     WorkflowCallEventInputType, WorkflowDispatchEvent, WorkflowDispatchEventInputType,
 };
-use crate::quotes::{quotes, sorted_quotes};
+use crate::quotes::{quote, quotes, sorted_quotes};
 use crate::rule::{Pass, Rule, RuleBase};
 
 /// The `events` rule.
@@ -63,6 +63,22 @@ impl RuleEvents {
                 format!(
                     "invalid CRON format {} in schedule event: parser does not accept descriptors",
                     quotes(&[&spec.value])
+                ),
+            );
+            return;
+        }
+
+        // Go's `robfig/cron` validates the field count before any other check and phrases the
+        // failure as `expected exactly 5 fields, found M: [spec]`. croner phrases the same failure
+        // differently, so the count is checked up front to keep the message byte-aligned.
+        let field_count = spec.value.split_whitespace().count();
+        if field_count != 5 {
+            self.base.error_at(
+                spec.pos,
+                format!(
+                    "invalid CRON format {} in schedule event: expected exactly 5 fields, found {field_count}: [{}]",
+                    quotes(&[&spec.value]),
+                    spec.value
                 ),
             );
             return;
@@ -123,9 +139,13 @@ impl RuleEvents {
     /// therefore not reported by this rule. This is a known, intentional limitation.
     fn check_timezone(&mut self, tz: &String) {
         let v = tz.value.as_str();
+        // Go's `time.LoadLocation` accepts the special names "", "UTC" and "Local", but the
+        // original explicitly rejects them because they are not valid IANA zone names. Otherwise a
+        // name is valid only if it resolves in the IANA tz database, which `chrono_tz::Tz`
+        // validates against its embedded copy of the database.
         let special =
             v.is_empty() || v.eq_ignore_ascii_case("utc") || v.eq_ignore_ascii_case("local");
-        if special || !is_valid_iana_name_format(v) {
+        if special || v.parse::<chrono_tz::Tz>().is_err() {
             self.base.error_at(
                 tz.pos,
                 format!(
@@ -185,9 +205,10 @@ impl RuleEvents {
             self.base.error_at(
                 p,
                 format!(
-                    "both {} and {} filters cannot be used for the same event {hook}. note: use '!' to negate patterns",
+                    "both {} and {} filters cannot be used for the same event {}. note: use '!' to negate patterns",
                     quotes(&[&f.name.value]),
-                    quotes(&[&i.name.value])
+                    quotes(&[&i.name.value]),
+                    quotes(&[hook])
                 ),
             );
         }
@@ -297,7 +318,7 @@ impl RuleEvents {
             if !default.contains_expression() {
                 match i.input_type {
                     WorkflowCallEventInputType::Number => {
-                        if let Err(err) = default.value.parse::<f64>() {
+                        if let Err(err) = go_parse_float(&default.value) {
                             self.base.error_at(
                                 default.pos,
                                 format!(
@@ -371,13 +392,15 @@ impl RuleEvents {
                         .map(|o| o.value.as_str())
                         .collect::<Vec<_>>();
                     if !seen.contains(default.value.as_str()) {
+                        // The options are each quoted and joined, then the whole list is quoted
+                        // again (Go wraps the joined string in `%q`), escaping the inner quotes.
+                        let options = quote(&quotes(&options));
                         self.base.error_at(
                             default.pos,
                             format!(
-                                "default value {} of {} input is not included in its options {}",
+                                "default value {} of {} input is not included in its options {options}",
                                 quotes(&[&default.value]),
                                 quotes(&[n]),
-                                quotes(&options)
                             ),
                         );
                     }
@@ -395,7 +418,7 @@ impl RuleEvents {
                 if let Some(default) = &i.default {
                     match i.input_type {
                         WorkflowDispatchEventInputType::Number => {
-                            if let Err(err) = default.value.parse::<f64>() {
+                            if let Err(err) = go_parse_float(&default.value) {
                                 self.base.error_at(
                                     default.pos,
                                     format!(
@@ -438,30 +461,6 @@ impl RuleEvents {
     }
 }
 
-/// Returns whether `name` is shaped like an IANA timezone name.
-///
-/// This is a *format* check only (see [`RuleEvents::check_timezone`] for why the tz database is
-/// not consulted). Each `/`-separated component must start with an ASCII letter and contain only
-/// characters allowed in IANA zone names. Real names such as `America/New_York`, `Etc/GMT+5` and
-/// `GMT` are accepted; empty components, non-ASCII characters and stray separators are rejected.
-fn is_valid_iana_name_format(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    for part in name.split('/') {
-        let mut chars = part.chars();
-        if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) {
-            return false;
-        }
-        for c in chars {
-            if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.')) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 impl Default for RuleEvents {
     fn default() -> Self {
         Self::new()
@@ -496,6 +495,32 @@ impl Rule for RuleEvents {
 
     fn set_config(&mut self, config: crate::config::Config) {
         self.base.set_config(config);
+    }
+}
+
+/// Parses `s` as a 64-bit float the way Go's `strconv.ParseFloat` does, returning a Go-formatted
+/// error message on failure.
+///
+/// The original reports the raw `strconv.ParseFloat` error, which reads
+/// `strconv.ParseFloat: parsing "X": invalid syntax` for malformed input or
+/// `... value out of range` when a finite-looking literal overflows. Rust's `f64::from_str` only
+/// errors on malformed input (it yields infinity on overflow), so the overflow case is detected by
+/// checking whether a non-infinity spelling parsed to an infinite value.
+fn go_parse_float(s: &str) -> Result<f64, std::string::String> {
+    const PREFIX: &str = "strconv.ParseFloat: parsing";
+    match s.parse::<f64>() {
+        Ok(v) => {
+            let is_inf_spelling = {
+                let t = s.trim().trim_start_matches(['+', '-']).to_ascii_lowercase();
+                t == "inf" || t == "infinity"
+            };
+            if v.is_infinite() && !is_inf_spelling {
+                Err(format!("{PREFIX} {}: value out of range", quotes(&[s])))
+            } else {
+                Ok(v)
+            }
+        }
+        Err(_) => Err(format!("{PREFIX} {}: invalid syntax", quotes(&[s]))),
     }
 }
 
@@ -747,9 +772,7 @@ mod tests {
                 WorkflowCallEventInputType::Number,
                 Some("notanumber"),
             )],
-            secrets: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            pos: Pos::new(2, 3),
+            ..Default::default()
         };
         let errs = run(vec![Event::WorkflowCall(e)]);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
@@ -768,9 +791,7 @@ mod tests {
                 WorkflowCallEventInputType::Number,
                 Some("3.14"),
             )],
-            secrets: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            pos: Pos::new(2, 3),
+            ..Default::default()
         };
         let errs = run(vec![Event::WorkflowCall(e)]);
         assert!(errs.is_empty(), "unexpected: {errs:?}");
@@ -784,9 +805,7 @@ mod tests {
                 WorkflowCallEventInputType::Boolean,
                 Some("yes"),
             )],
-            secrets: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            pos: Pos::new(2, 3),
+            ..Default::default()
         };
         let errs = run(vec![Event::WorkflowCall(e)]);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
@@ -801,9 +820,7 @@ mod tests {
                 WorkflowCallEventInputType::Number,
                 Some("${{ github.sha }}"),
             )],
-            secrets: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            pos: Pos::new(2, 3),
+            ..Default::default()
         };
         let errs = run(vec![Event::WorkflowCall(e)]);
         assert!(errs.is_empty(), "unexpected: {errs:?}");
@@ -819,9 +836,7 @@ mod tests {
         });
         let e = WorkflowCallEvent {
             inputs: vec![i],
-            secrets: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            pos: Pos::new(2, 3),
+            ..Default::default()
         };
         let errs = run(vec![Event::WorkflowCall(e)]);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");

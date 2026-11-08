@@ -56,7 +56,10 @@ impl Command {
     fn run(&mut self, args: Vec<OsString>) -> Result<u8, u8> {
         let cli = match parse_args(&args) {
             Ok(cli) => cli,
-            Err(ParseError::Help) => return Ok(EXIT_STATUS_SUCCESS_NO_PROBLEM),
+            Err(ParseError::Help) => {
+                self.print_usage();
+                return Ok(EXIT_STATUS_SUCCESS_NO_PROBLEM);
+            }
             Err(ParseError::Invalid(msg)) => {
                 let _ = writeln!(self.stderr, "{msg}");
                 return Err(EXIT_STATUS_INVALID_COMMAND_OPTION);
@@ -78,6 +81,102 @@ impl Command {
         }
 
         self.run_linter(&cli)
+    }
+
+    /// Prints the usage header and flag descriptions to stderr. Mirrors the original `printUsageHeader`
+    /// and the Go `flag` package's `-h` handling.
+    fn print_usage(&mut self) {
+        let v = version();
+        // The docs links embed the release tag when the version looks like a semver tag.
+        let b = if regex::Regex::new(r"^\d+\.\d+\.\d+$").is_ok_and(|re| re.is_match(&v)) {
+            format!("v{v}")
+        } else {
+            "main".to_string()
+        };
+        let _ = write!(
+            self.stderr,
+            "Usage: actionlint [FLAGS] [FILES...] [-]
+
+  actionlint is a linter for GitHub Actions workflow files.
+
+  To check all YAML files in current repository, just run actionlint without
+  arguments. It automatically finds the nearest '.github/workflows' directory:
+
+    $ actionlint
+
+  To check specific files, pass the file paths as arguments:
+
+    $ actionlint file1.yaml file2.yaml
+
+  To check content which is not saved in file yet (e.g. output from some
+  command), pass - argument. It reads stdin and checks it as workflow file:
+
+    $ actionlint -
+
+  To serialize errors into JSON, use -format option. It allows to format error
+  messages flexibly with Go template syntax.
+
+    $ actionlint -format '{{json .}}'
+
+Documents:
+
+  - List of checks: https://github.com/rhysd/actionlint/tree/{b}/docs/checks.md
+  - Usage:          https://github.com/rhysd/actionlint/tree/{b}/docs/usage.md
+  - Configuration:  https://github.com/rhysd/actionlint/tree/{b}/docs/config.md
+
+Flags:
+"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -h, -help\n    \tshow this help message and exit\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -color\n    \tAlways enable colorful output. This is useful to force colorful outputs\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -config-file string\n    \tFile path to config file\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -debug\n    \tEnable debug output (for development)\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -format string\n    \tCustom template to format error messages in Go template syntax. See the usage documentation for more details\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -ignore value\n    \tRegular expression to filter errors. The pattern is matched with the error messages. This flag can be used multiple times\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -init-config\n    \tGenerate default config file at .github/actionlint.yaml in current project\n"
+        );
+        let _ = write!(self.stderr, "  -no-color\n    \tDisable colorful output\n");
+        let _ = write!(
+            self.stderr,
+            "  -oneline\n    \tUse one line per error for the error messages\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -pyflakes string\n    \tFile path to the pyflakes command. To disable the integration, set empty string (default \"pyflakes\")\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -shellcheck string\n    \tFile path to the shellcheck command. To disable the integration, set empty string (default \"shellcheck\")\n"
+        );
+        let _ = write!(
+            self.stderr,
+            "  -stdin-filename string\n    \tFile name when reading input from stdin (default \"<stdin>\")\n"
+        );
+        let _ = write!(self.stderr, "  -verbose\n    \tEnable verbose output\n");
+        let _ = write!(
+            self.stderr,
+            "  -version\n    \tShow version and how this binary was installed\n"
+        );
     }
 
     fn init_config(&mut self) -> Result<u8, u8> {

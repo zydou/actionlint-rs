@@ -135,8 +135,11 @@ fn is_alnum(r: char) -> bool {
 const EXPECTED_PUNCT_CHARS: &str =
     "''', '}', '(', ')', '[', ']', '.', '!', '<', '>', '=', '&', '|', '*', ',', ' '";
 const EXPECTED_DIGIT_CHARS: &str = "'0'..'9'";
-const EXPECTED_ALL_CHARS: &str =
-    "''', '}', '(', ')', '[', ']', '.', '!', '<', '>', '=', '&', '|', '*', ',', ' '";
+const EXPECTED_ALL_CHARS: &str = concat!(
+    "'a'..'z', 'A'..'Z', '_', ",
+    "'0'..'9', ",
+    "''', '}', '(', ')', '[', ']', '.', '!', '<', '>', '=', '&', '|', '*', ',', ' '"
+);
 
 /// A lexer for expression syntax.
 #[derive(Debug)]

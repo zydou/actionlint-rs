@@ -104,6 +104,22 @@ impl<'a> Linter<'a> {
         })
     }
 
+    /// Creates a new `Linter` like [`Linter::new`], but with an explicit default config that takes
+    /// priority over both the `-config-file` option and the repository config file. This mirrors the
+    /// original tests' `linter.defaultConfig = &Config{}` override and lets callers force a specific
+    /// config (e.g. an empty one) regardless of the files on disk.
+    ///
+    /// Returns an error under the same conditions as [`Linter::new`].
+    pub fn new_with_config(
+        out: &'a mut dyn std::io::Write,
+        opts: LinterOptions,
+        default_config: Option<Config>,
+    ) -> Result<Self, String> {
+        let mut linter = Self::new(out, opts)?;
+        linter.default_config = default_config;
+        Ok(linter)
+    }
+
     /// Lints the workflow content read from stdin.
     pub fn lint_stdin(&mut self, content: &str) -> Result<Vec<Error>, String> {
         let name = self.stdin_name.clone();
@@ -175,7 +191,11 @@ impl<'a> Linter<'a> {
             if self.err_fmt.is_some() {
                 fields.extend(errs.iter().map(|e| e.template_fields(&content)));
             } else {
-                let src = if self.opts.oneline { &[][..] } else { &content[..] };
+                let src = if self.opts.oneline {
+                    &[][..]
+                } else {
+                    &content[..]
+                };
                 for e in &errs {
                     e.pretty_print(&mut *self.out, src);
                 }
@@ -271,9 +291,7 @@ impl<'a> Linter<'a> {
             if self.ignore_pats.matches(&e.message) {
                 return false;
             }
-            !path_cfgs
-                .iter()
-                .any(|pc| pc.ignore.matches(&e.message))
+            !path_cfgs.iter().any(|pc| pc.ignore.matches(&e.message))
         });
         errs
     }
@@ -320,16 +338,19 @@ pub fn run_rules(
     push!(crate::rule_runner_label::RuleRunnerLabel::new());
     push!(crate::rule_events::RuleEvents::new());
     push!(crate::rule_job_needs::RuleJobNeeds::new());
-    push!(crate::rule_action::RuleAction::new(actions_cache));
+    push!(crate::rule_action::RuleAction::new(actions_cache.clone()));
     push!(crate::rule_env_var::RuleEnvVar::new());
     push!(crate::rule_id::RuleId::new());
     push!(crate::rule_glob::RuleGlob::new());
     push!(crate::rule_permissions::RulePermissions::new());
     push!(crate::rule_workflow_call::RuleWorkflowCall::new(
         PathBuf::from(path),
+        reusable_cache.clone(),
+    ));
+    push!(crate::rule_expression::RuleExpression::new(
+        actions_cache,
         reusable_cache,
     ));
-    push!(crate::rule_expression::RuleExpression::new());
     push!(crate::rule_deprecated_commands::RuleDeprecatedCommands::new());
     push!(crate::rule_if_cond::RuleIfCond::new());
 

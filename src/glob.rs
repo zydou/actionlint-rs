@@ -219,9 +219,11 @@ impl GlobValidator {
             }
         }
 
+        // A single-character match only ever exits the loop via the `]` case above (a range sets
+        // `chars` to 2), so the offending character Go reports here is always the closing `]`.
         if chars == 1 {
             self.unexpected(
-                None,
+                Some(']'),
                 "character match []",
                 "character match with single character is useless. simply use x instead of [x]",
             );

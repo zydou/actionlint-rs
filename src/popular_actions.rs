@@ -24162,6 +24162,7 @@ fn build_popular_actions() -> HashMap<&'static str, ActionMetadata> {
                 m
             }
         };
+        md.skip_outputs = true;
         map.insert("dorny/paths-filter@v3", md);
     }
     {
@@ -24245,6 +24246,7 @@ fn build_popular_actions() -> HashMap<&'static str, ActionMetadata> {
                 m
             }
         };
+        md.skip_outputs = true;
         map.insert("dorny/paths-filter@v4", md);
     }
     {
@@ -27276,6 +27278,7 @@ fn build_popular_actions() -> HashMap<&'static str, ActionMetadata> {
                 m
             }
         };
+        md.skip_outputs = true;
         map.insert("google-github-actions/get-secretmanager-secrets@v2", md);
     }
     {
@@ -27332,6 +27335,7 @@ fn build_popular_actions() -> HashMap<&'static str, ActionMetadata> {
                 m
             }
         };
+        md.skip_outputs = true;
         map.insert("google-github-actions/get-secretmanager-secrets@v3", md);
     }
     {
@@ -29892,6 +29896,7 @@ fn build_popular_actions() -> HashMap<&'static str, ActionMetadata> {
                 m
             }
         };
+        md.skip_inputs = true;
         map.insert("octokit/request-action@v2.x", md);
     }
     {
@@ -29921,6 +29926,7 @@ fn build_popular_actions() -> HashMap<&'static str, ActionMetadata> {
                 m
             }
         };
+        md.skip_inputs = true;
         map.insert("octokit/request-action@v3.x", md);
     }
     {

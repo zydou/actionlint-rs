@@ -259,11 +259,14 @@ impl LocalReusableWorkflowCache {
         }
 
         let file = proj.root_dir().join(spec.trim_start_matches("./"));
-        let Ok(src) = std::fs::read(&file) else {
-            self.cache.write().unwrap().insert(spec.to_string(), None);
-            return Err(format!(
-                "could not read reusable workflow file for {spec:?}"
-            ));
+        let src = match std::fs::read(&file) {
+            Ok(src) => src,
+            Err(e) => {
+                self.cache.write().unwrap().insert(spec.to_string(), None);
+                return Err(format!(
+                    "could not read reusable workflow file for {spec:?}: {e}"
+                ));
+            }
         };
 
         match parse_reusable_workflow_metadata(&src) {
@@ -305,6 +308,17 @@ impl LocalReusableWorkflowCache {
             s = format!("./{s}");
         }
         Some(s)
+    }
+
+    /// Writes `val` into the cache for `key`, overwriting any existing entry. Counterpart of the Go
+    /// `writeCache`.
+    ///
+    /// The workflow-call rule uses this to remember that an invalid local `uses` spec (e.g. one that
+    /// carries a `@ref`) already produced a format error, so that a later `find_metadata` lookup
+    /// returns `Ok(None)` instead of emitting a redundant "could not read reusable workflow file"
+    /// error.
+    pub fn write_cache(&self, key: &str, val: Option<ReusableWorkflowMetadata>) {
+        self.cache.write().unwrap().insert(key.to_string(), val);
     }
 
     /// Writes reusable workflow metadata by converting from a [`WorkflowCallEvent`] AST node.
@@ -559,6 +573,7 @@ jobs:
         let event = WorkflowCallEvent {
             inputs,
             secrets,
+            secrets_present: true,
             outputs: BTreeMap::new(),
             pos: Pos::new(1, 1),
         };

@@ -53,9 +53,39 @@ pub struct ActionMetadataRuns {
     /// The `main` configuration for a JavaScript action.
     #[serde(default)]
     pub main: String,
+    /// The `pre` configuration for a JavaScript action.
+    #[serde(default)]
+    pub pre: String,
+    /// The `pre-if` condition for a JavaScript action.
+    #[serde(default)]
+    pub pre_if: String,
+    /// The `post` configuration for a JavaScript action.
+    #[serde(default)]
+    pub post: String,
+    /// The `post-if` condition for a JavaScript action.
+    #[serde(default)]
+    pub post_if: String,
+    /// The `steps` configuration for a composite action. Any YAML value can be placed here.
+    #[serde(default)]
+    pub steps: Vec<serde_json::Value>,
     /// The `image` of `action.yaml` for a Docker action.
     #[serde(default)]
     pub image: String,
+    /// The `pre-entrypoint` of `action.yaml` for a Docker action.
+    #[serde(default)]
+    pub pre_entrypoint: String,
+    /// The `entrypoint` of `action.yaml` for a Docker action.
+    #[serde(default)]
+    pub entrypoint: String,
+    /// The `post-entrypoint` of `action.yaml` for a Docker action.
+    #[serde(default)]
+    pub post_entrypoint: String,
+    /// The `args` of `action.yaml` for a Docker action. Any YAML value can be placed here.
+    #[serde(default)]
+    pub args: Vec<serde_json::Value>,
+    /// The `env` of `action.yaml` for a Docker action.
+    #[serde(default)]
+    pub env: BTreeMap<String, serde_json::Value>,
 }
 
 /// The `branding` section of `action.yaml`.

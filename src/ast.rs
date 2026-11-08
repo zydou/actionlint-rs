@@ -54,6 +54,14 @@ pub struct String {
     pub pos: Pos,
 }
 
+impl Default for String {
+    /// Creates an empty, unquoted string at the default (zero) position. This mirrors the value
+    /// the job parser uses for a `uses:` key that is absent or null.
+    fn default() -> Self {
+        Self::new("", false, Pos::default())
+    }
+}
+
 impl String {
     /// Creates a new positioned string.
     pub fn new(value: impl Into<std::string::String>, quoted: bool, pos: Pos) -> Self {
@@ -372,13 +380,21 @@ pub struct WorkflowCallEventOutput {
 }
 
 /// The `workflow_call` event configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkflowCallEvent {
     /// The inputs of the event. This is a list (not a map) because the order matters when
     /// checking default values.
     pub inputs: Vec<WorkflowCallEventInput>,
     /// Map from secret name (lower cased) to its configuration.
     pub secrets: BTreeMap<std::string::String, WorkflowCallEventSecret>,
+    /// Whether the `secrets:` key was specified under `workflow_call:`, even if it has no child.
+    ///
+    /// This mirrors the original, where `Secrets` is `nil` when `secrets:` is omitted but an empty
+    /// (non-nil) map when `secrets:` exists with no child. The distinction matters: when `secrets:`
+    /// is present but empty, the `secrets` context must be a strict object with no properties so
+    /// that referring to any secret is an error, rather than the permissive `{ string => string }`
+    /// used when secrets may be inherited from a caller.
+    pub secrets_present: bool,
     /// Map from output name (lower cased) to its configuration.
     pub outputs: BTreeMap<std::string::String, WorkflowCallEventOutput>,
     /// The position in the source.
@@ -617,12 +633,24 @@ impl RawYAMLValue {
     }
 
     /// Returns whether this value equals `other` structurally.
+    ///
+    /// Positions are deliberately ignored (matching the original's `Equals`), so two values that
+    /// are spelled the same but appear at different places in the source compare equal. This is
+    /// relied upon by the matrix duplicate-value check.
     #[must_use]
     pub fn equals(&self, other: &RawYAMLValue) -> bool {
         match (self, other) {
-            (RawYAMLValue::Object(a), RawYAMLValue::Object(b)) => a == b,
-            (RawYAMLValue::Array(a), RawYAMLValue::Array(b)) => a == b,
-            (RawYAMLValue::String(a), RawYAMLValue::String(b)) => a == b,
+            (RawYAMLValue::Object(a), RawYAMLValue::Object(b)) => {
+                a.props.len() == b.props.len()
+                    && a.props
+                        .iter()
+                        .all(|(n, v1)| b.props.get(n).is_some_and(|v2| v1.equals(v2)))
+            }
+            (RawYAMLValue::Array(a), RawYAMLValue::Array(b)) => {
+                a.elems.len() == b.elems.len()
+                    && a.elems.iter().zip(&b.elems).all(|(e1, e2)| e1.equals(e2))
+            }
+            (RawYAMLValue::String(a), RawYAMLValue::String(b)) => a.value == b.value,
             _ => false,
         }
     }
@@ -905,10 +933,18 @@ pub struct WorkflowCallSecret {
 }
 
 /// A workflow call at `jobs.<job_id>.uses`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkflowCall {
     /// The workflow specification to be called (mandatory).
     pub uses: String,
+    /// Whether the `uses:` key was specified, even if its value is empty.
+    ///
+    /// This mirrors the original, where `Uses` is a `*String` that is non-nil whenever `uses:` is
+    /// present (possibly pointing at an empty string for `uses:` with a null value). The job parser
+    /// uses this to distinguish "a call job whose `uses` is empty" (only the empty-string error is
+    /// reported) from "a normal job that has no `uses` at all" (where `steps`/`runs-on` are
+    /// required and call-only keys are rejected).
+    pub uses_present: bool,
     /// Map from input name (lower cased) to its value at `with:`.
     pub inputs: BTreeMap<std::string::String, WorkflowCallInput>,
     /// Map from secret name (lower cased) to its value at `secrets:`.
@@ -1083,6 +1119,7 @@ mod tests {
             on: vec![Event::WorkflowCall(WorkflowCallEvent {
                 inputs: vec![],
                 secrets: BTreeMap::new(),
+                secrets_present: false,
                 outputs: BTreeMap::new(),
                 pos: Pos::new(1, 1),
             })],

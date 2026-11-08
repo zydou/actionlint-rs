@@ -118,8 +118,13 @@ fn is_not_found(err: &str) -> bool {
 }
 
 fn parse_self_hosted_runner(v: &saphyr::Yaml<'_>, config: &mut Config) -> Result<(), String> {
-    let saphyr::Yaml::Mapping(mapping) = v else {
+    // `null` is the zero value, but any other non-mapping (e.g. a scalar) is a type error, matching
+    // the original's strict YAML unmarshalling into the config struct.
+    if matches!(v, saphyr::Yaml::Value(saphyr::Scalar::Null)) {
         return Ok(());
+    }
+    let saphyr::Yaml::Mapping(mapping) = v else {
+        return Err("self-hosted-runner must be a mapping node".to_string());
     };
     for (k, val) in mapping {
         if scalar_str(k).as_deref() == Some("labels") {

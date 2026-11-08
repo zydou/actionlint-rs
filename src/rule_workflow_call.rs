@@ -159,6 +159,13 @@ impl Pass for RuleWorkflowCall {
             return Ok(());
         }
 
+        // When the spec is an invalid local reusable workflow call, remember it caused an error by
+        // caching `None`. This prevents a later lookup from emitting a redundant "could not read
+        // reusable workflow file" error, matching the original.
+        if u.value.starts_with("./") {
+            self.cache.write_cache(&u.value, None);
+        }
+
         self.base.error_at(
             u.pos,
             format!(
@@ -309,9 +316,7 @@ mod tests {
             services: None,
             workflow_call: Some(WorkflowCall {
                 uses: String::at("invalid-uses", Pos::new(4, 10)),
-                inputs: Default::default(),
-                secrets: Default::default(),
-                inherit_secrets: false,
+                ..Default::default()
             }),
             snapshot: None,
             pos: Pos::new(1, 1),
@@ -346,9 +351,7 @@ mod tests {
             services: None,
             workflow_call: Some(WorkflowCall {
                 uses: String::at("${{ matrix.wf }}", Pos::new(4, 10)),
-                inputs: Default::default(),
-                secrets: Default::default(),
-                inherit_secrets: false,
+                ..Default::default()
             }),
             snapshot: None,
             pos: Pos::new(1, 1),

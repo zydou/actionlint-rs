@@ -57,18 +57,19 @@ impl ExprParser {
         if self.err.is_some() {
             return;
         }
-        let quoted: Vec<String> = expected.iter().map(|e| format!("'{e}'")).collect();
+        // The expected token kinds are each quoted Go-style (`strconv.Quote`, i.e. double quotes)
+        // and joined with ", " via the `quotesBuilder` in the original.
+        let kinds: Vec<String> = expected
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let quoted = crate::quotes::quotes(&kinds);
         let what = if self.cur.kind == TokenKind::End {
             "end of input".to_string()
         } else {
             format!("token {:?}", self.cur.kind.to_string())
         };
-        let msg = format!(
-            "unexpected {} while parsing {}. expecting {}",
-            what,
-            where_,
-            quoted.join(", ")
-        );
+        let msg = format!("unexpected {what} while parsing {where_}. expecting {quoted}");
         self.error(msg);
     }
 
@@ -380,7 +381,7 @@ impl ExprParser {
             }
             let msg = format!(
                 "parser did not reach end of input after parsing the expression. {c} remaining token(s) in the input: {}",
-                kinds.join(", ")
+                crate::quotes::quotes(&kinds)
             );
             self.error(msg);
             return Err(self.err.clone().unwrap());
