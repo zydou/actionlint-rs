@@ -1,0 +1,63 @@
+//! The `runner-label` rule.
+//!
+//! Checks: Checks for runner label. Rust counterpart of the original `rule_rule_runner_label.go`.
+
+use crate::rule::{Pass, Rule, RuleBase};
+
+/// The `runner-label` rule.
+#[derive(Debug)]
+pub struct RuleRunnerLabel {
+    base: RuleBase,
+}
+
+impl RuleRunnerLabel {
+    /// Creates a new `runner-label` rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            base: RuleBase::new("runner-label", "Checks for runner label"),
+        }
+    }
+}
+
+impl Default for RuleRunnerLabel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pass for RuleRunnerLabel {}
+
+impl Rule for RuleRunnerLabel {
+    fn take_errors(&mut self) -> Vec<crate::error::Error> {
+        self.base.take_errors()
+    }
+
+    fn name(&self) -> &'static str {
+        self.base.name()
+    }
+
+    fn description(&self) -> &'static str {
+        self.base.description()
+    }
+
+    fn enable_debug(&mut self, out: Box<dyn std::io::Write + Send>) {
+        self.base.enable_debug(out);
+    }
+
+    fn set_config(&mut self, config: crate::config::Config) {
+        self.base.set_config(config);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_description() {
+        let r = RuleRunnerLabel::new();
+        assert_eq!(r.name(), "runner-label");
+        assert!(!r.description().is_empty());
+    }
+}

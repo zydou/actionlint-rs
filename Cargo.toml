@@ -1,0 +1,75 @@
+[package]
+name = "actionlint"
+version = "1.0.0"
+edition = "2024"
+description = "A Rust reimplementation of the actionlint."
+license = "MIT"
+repository = "https://github.com/zydou/actionlint"
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "actionlint"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# YAML 1.2 parser exposing a position-aware node tree (counterpart of go.yaml.in/yaml/v4).
+saphyr = "0.3"
+# Golang template syntax for the --format option (counterpart of text/template).
+gtmpl = "0.7"
+# `**` glob matching for config `paths` (counterpart of bmatcuk/doublestar).
+globset = "0.4"
+# Colorful output honoring NO_COLOR / tty detection (counterpart of fatih/color).
+colored = "3"
+# Terminal display width for the error indicator `^~~~` (counterpart of mattn/go-runewidth).
+unicode-width = "0.2"
+# Shell-like word splitting for shellcheck/pyflakes command lines (counterpart of mattn/go-shellwords).
+shellwords = "1"
+# Standard 5-field cron parsing for `schedule` events (counterpart of robfig/cron).
+croner = "4"
+# Regular expressions for --ignore and config `ignore` patterns.
+regex = "1"
+# Data serialization for action metadata and JSON output.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Work-stealing parallelism for linting multiple files (counterpart of errgroup+semaphore).
+rayon = "1"
+# Ergonomic library error definitions.
+thiserror = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Relax the pedantic lints that are noise for a large Go->Rust port of a parser/linter:
+# getters returning &self, large parser functions mirroring the original structure, numeric
+# casts in position/offset math, and manual Debug impls that intentionally hide writer fields.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+missing_fields_in_debug = "allow"
+struct_excessive_bools = "allow"
+large_enum_variant = "allow"
+unnecessary_wraps = "allow"
+match_same_arms = "allow"
+needless_pass_by_value = "allow"
+redundant_else = "allow"
+manual_let_else = "allow"
+semicolon_if_nothing_returned = "allow"
+assigning_clones = "allow"

@@ -1,0 +1,104 @@
+---
+# Release: one binary per (platform, ABI) pair, attached to the GitHub Release of the pushed tag.
+
+# Linux targets go through cross-rs so the binary comes out of a fixed toolchain image instead of whatever the runner ships.
+# The macOS targets build natively — `x86_64-apple-darwin` on an Intel runner, `aarch64-apple-darwin` on the arm64 one.
+
+# Trigger: every push. A `v*` tag releases to that tag;
+# any branch push releases to `nightly`, so the latest main build is always published.
+# `workflow_dispatch` builds the checked-out ref and attaches it to the release named by the `release` input (default `nightly`)
+
+name: Release
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      release:
+        required: true
+        description: release to attach the binaries to
+        default: nightly
+        type: string
+
+# Attaching to a release needs more than the read-only default token.
+permissions:
+  contents: write
+
+# A re-pushed tag or a second dispatch supersedes the run in flight for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO: cargo
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+            cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Cross
+        # The pre-built cross binary rather than `cargo install cross`, which spends ~5 min compiling a tool the job uses once.
+        if: ${{ matrix.cross }}
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xzf - -C "$HOME/.cargo/bin"
+          echo "CARGO=cross" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: |
+          rustup update
+          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }}
+
+      - name: Package ${{ matrix.target }}
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          tar -cJf "actionlint-${{ matrix.target }}.tar.xz" actionlint
+          mv "actionlint-${{ matrix.target }}.tar.xz" "$GITHUB_WORKSPACE/"
+
+      - name: Release
+        env:
+          # A tag push releases that tag; a dispatch releases to the name given in the `release` input;
+          # any other push releases to nightly.
+          # The action creates the release — and the tag — when the name is missing.
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || (github.event_name == 'workflow_dispatch' && inputs.release) || 'nightly' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          files: actionlint-*.tar.xz
+          # A nightly build is a moving target, not a real release: keep it
+          # from being marked as the repo's "Latest" so it never shadows the
+          # latest `v*` tag. Only tag pushes are the official latest.
+          make_latest: ${{ github.ref_type == 'tag' }}
