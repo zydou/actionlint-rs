@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::io::Write;
+use std::path::PathBuf;
 
 use colored::Colorize;
 use unicode_width::UnicodeWidthChar;
@@ -342,20 +343,18 @@ impl ErrorFormatter {
     }
 }
 
-/// Maps the `PascalCase` template field name to its lowercase JSON tag name, matching the json tags
-/// of the original `ErrorTemplateFields` struct.
-fn json_field_name(pascal: &str) -> Option<&'static str> {
-    match pascal {
-        "Message" => Some("message"),
-        "Filepath" => Some("filepath"),
-        "Line" => Some("line"),
-        "Column" => Some("column"),
-        "Kind" => Some("kind"),
-        "Snippet" => Some("snippet"),
-        "EndColumn" => Some("end_column"),
-        _ => None,
-    }
-}
+/// The error template fields in their canonical (struct declaration) order, matching the json tags
+/// of the original Go `ErrorTemplateFields` struct. `encoding/json` emits struct fields in this
+/// order, so the `json` template function must serialize them the same way.
+const CANONICAL_ERROR_FIELDS: [&str; 7] = [
+    "message",
+    "filepath",
+    "line",
+    "column",
+    "kind",
+    "snippet",
+    "end_column",
+];
 
 /// Converts a [`gtmpl::Value`] into a [`serde_json::Value`], applying the `omitempty` semantics of
 /// the original json tags for the known error fields.
@@ -365,11 +364,15 @@ fn gtmpl_to_json(v: &gtmpl::Value, omit_empty: bool) -> serde_json::Value {
         Value::Nil => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Number(n) => {
-            let f = n.as_f64().unwrap_or(0.0);
-            if f.fract() == 0.0 && f.is_finite() {
-                serde_json::Value::from(f as i64)
+            // gtmpl_value stores integral numbers as `Num::U`/`Num::I` and only floats as
+            // `Num::F`, so `as_f64()` returns `None` for integers (e.g. line/column). Try the
+            // integer forms first and only fall back to a float, otherwise positions become 0.
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::from(i)
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::from(u)
             } else {
-                serde_json::Value::from(f)
+                serde_json::Value::from(n.as_f64().unwrap_or(0.0))
             }
         }
         Value::String(s) => serde_json::Value::String(s.clone()),
@@ -378,16 +381,21 @@ fn gtmpl_to_json(v: &gtmpl::Value, omit_empty: bool) -> serde_json::Value {
         }
         Value::Object(o) => {
             let mut map = serde_json::Map::new();
-            for (k, val) in o {
-                if let Some(lower) = json_field_name(k) {
-                    if omit_empty
-                        && let Value::String(s) = val
-                        && s.is_empty()
-                    {
-                        continue;
-                    }
-                    map.insert(lower.to_string(), gtmpl_to_json(val, omit_empty));
+            // Go's encoding/json emits struct fields in declaration order. gtmpl's object is a
+            // HashMap with nondeterministic order, so walk the canonical field order explicitly
+            // and insert each present field in that order (serde_json's `preserve_order` feature
+            // keeps the resulting Map ordered).
+            for lower in CANONICAL_ERROR_FIELDS {
+                let Some(val) = o.get(lower) else {
+                    continue;
+                };
+                if omit_empty
+                    && let Value::String(s) = val
+                    && s.is_empty()
+                {
+                    continue;
                 }
+                map.insert((*lower).to_string(), gtmpl_to_json(val, omit_empty));
             }
             serde_json::Value::Object(map)
         }
@@ -399,9 +407,11 @@ fn gtmpl_to_json(v: &gtmpl::Value, omit_empty: bool) -> serde_json::Value {
 /// original's `json` helper (including `omitempty` for the known error fields).
 fn json_func(args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncError> {
     let arg = args.first().unwrap_or(&gtmpl::Value::Nil);
-    let json = serde_json::to_string(&gtmpl_to_json(arg, true)).map_err(|e| {
+    let mut json = serde_json::to_string(&gtmpl_to_json(arg, true)).map_err(|e| {
         gtmpl::FuncError::Generic(format!("could not encode template value into JSON: {e}"))
     })?;
+    // The original encodes through a json.Encoder, which appends a newline after the document.
+    json.push('\n');
     Ok(gtmpl::Value::String(json))
 }
 
@@ -436,30 +446,88 @@ fn get_version_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncE
 
 /// The `allKinds` template function: returns the list of registered rule kinds.
 fn all_kinds_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncError> {
-    // Built-in rule kinds; the full registry is not reachable from a plain function pointer, so
-    // this exposes the static syntax-check kind that is always present.
-    Ok(gtmpl::Value::Array(vec![gtmpl::Value::Object(
-        [
-            (
-                "Name".to_string(),
-                gtmpl::Value::String("syntax-check".into()),
-            ),
-            (
-                "name".to_string(),
-                gtmpl::Value::String("syntax-check".into()),
-            ),
-            (
-                "Description".to_string(),
-                gtmpl::Value::String("Checks for GitHub Actions workflow syntax".into()),
-            ),
-            (
-                "description".to_string(),
-                gtmpl::Value::String("Checks for GitHub Actions workflow syntax".into()),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    )]))
+    Ok(gtmpl::Value::Array(
+        all_rule_kinds()
+            .into_iter()
+            .map(|kind| {
+                gtmpl::Value::Object(
+                    [
+                        ("Name".to_string(), gtmpl::Value::String(kind.name.into())),
+                        ("name".to_string(), gtmpl::Value::String(kind.name.into())),
+                        (
+                            "Description".to_string(),
+                            gtmpl::Value::String(kind.description.into()),
+                        ),
+                        (
+                            "description".to_string(),
+                            gtmpl::Value::String(kind.description.into()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect(),
+    ))
+}
+
+/// The name and description of a rule, used to populate the `allKinds` format helper.
+struct RuleKind {
+    name: &'static str,
+    description: &'static str,
+}
+
+/// Collects the name and description of every built-in rule (plus the always-present
+/// `syntax-check`), sorted by name. This mirrors the original, which registers each rule with the
+/// error formatter so templates can look up rule kinds and their descriptions.
+fn all_rule_kinds() -> Vec<RuleKind> {
+    use crate::rule::Rule;
+    use std::sync::Arc;
+
+    // The `action` and `expression` rules share caches; the `workflow-call` rule shares a reusable
+    // workflow cache. They are constructed here only to read their metadata, so empty caches are
+    // sufficient and nothing is ever read from them.
+    let actions_cache = Arc::new(crate::action_metadata::LocalActionsCache::new(None));
+    let reusable_cache =
+        Arc::new(crate::reusable_workflow::LocalReusableWorkflowCache::new_null(None));
+
+    let rules: Vec<Box<dyn Rule>> = vec![
+        Box::new(crate::rule_action::RuleAction::new(actions_cache.clone())),
+        Box::new(crate::rule_credentials::RuleCredentials::new()),
+        Box::new(crate::rule_deprecated_commands::RuleDeprecatedCommands::new()),
+        Box::new(crate::rule_env_var::RuleEnvVar::new()),
+        Box::new(crate::rule_events::RuleEvents::new()),
+        Box::new(crate::rule_expression::RuleExpression::new(
+            actions_cache,
+            reusable_cache.clone(),
+        )),
+        Box::new(crate::rule_glob::RuleGlob::new()),
+        Box::new(crate::rule_id::RuleId::new()),
+        Box::new(crate::rule_if_cond::RuleIfCond::new()),
+        Box::new(crate::rule_job_needs::RuleJobNeeds::new()),
+        Box::new(crate::rule_matrix::RuleMatrix::new()),
+        Box::new(crate::rule_permissions::RulePermissions::new()),
+        Box::new(crate::rule_runner_label::RuleRunnerLabel::new()),
+        Box::new(crate::rule_shell_name::RuleShellName::new()),
+        Box::new(crate::rule_workflow_call::RuleWorkflowCall::new(
+            PathBuf::new(),
+            reusable_cache,
+        )),
+    ];
+
+    let mut kinds: Vec<RuleKind> = rules
+        .iter()
+        .map(|r| RuleKind {
+            name: r.name(),
+            description: r.description(),
+        })
+        .collect();
+    kinds.push(RuleKind {
+        name: "syntax-check",
+        description: "Checks for GitHub Actions workflow syntax",
+    });
+    kinds.sort_by(|a, b| a.name.cmp(b.name));
+    kinds
 }
 
 /// Converts an [`ErrorTemplateFields`] into a [`gtmpl::Value`] object.
