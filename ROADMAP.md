@@ -260,3 +260,45 @@ src/
 3. 单元 / 集成 / 端到端测试
 4. 适配目标平台的 CI 配置、`Cargo.toml`、Dependabot 配置
 5. 各必须支持目标的编译验证结果
+
+## 9. 移植进度
+
+按模块记录当前移植状态（随开发推进更新）。
+
+### 已完成
+
+| 模块 | 说明 |
+| ---- | ---- |
+| `ast.rs` | workflow AST 节点（含位置信息） |
+| `expr.rs` / `expr_ast.rs` / `expr_lexer.rs` / `expr_parser.rs` | 表达式词法/语法解析 |
+| `expr_type.rs` | 表达式类型系统（`ExprTypeKind`/`ObjectType` 等） |
+| `expr_insecure.rs` | 模板注入检测 |
+| `parse.rs`（进行中） | workflow YAML 解析器（位置感知） |
+| `expr_sema.rs`（进行中） | 表达式语义类型检查 |
+| `rule_*.rs`（除 `expression`/`if_cond`） | 15 条规则已移植并含单元测试 |
+| `error.rs` | 错误类型、`summary()`、`pretty_print`、`ErrorFormatter`、排序/去重 |
+| `linter.rs` | 编排：配置加载、ignore 过滤、规则运行、两种输出 |
+| `command.rs` | CLI 参数解析、退出码、init-config、version |
+| `config.rs` / `project.rs` | 配置解析、项目定位 |
+| `glob.rs` | `path_match`（Go `path.Match` 移植）、glob 规则支持 |
+| `action_metadata.rs` / `reusable_workflow.rs` / `popular_actions.rs` | action 元数据、可复用 workflow、popular action 数据表 |
+| `availability.rs` / `all_webhooks.rs` | context 可用性、webhook payload 类型 |
+| `process.rs` | 外部命令并发执行 |
+
+### 待完成
+
+| 模块 | 阻塞点 |
+| ---- | ---- |
+| `expr_sema.rs` | 进行中（语义类型检查） |
+| `rule_expression.rs` | 依赖 `expr_sema.rs` |
+| `rule_if_cond.rs` | 依赖 `expr_sema.rs` |
+| `parse.rs` | 进行中（workflow 解析器） |
+| 集成 / 端到端测试 | 依赖 `parse.rs`（`testdata/{ok,err,examples}` fixture 驱动） |
+| 跨平台编译验证 | 依赖全部功能完成后用 `cross` 验证 musl、CI 验证 macOS |
+
+### 测试与质量状态
+
+- `cargo build --lib`：通过
+- `cargo test --lib`：255 通过
+- `cargo clippy --lib --all-features`：0 警告
+- `cargo fmt`：干净
