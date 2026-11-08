@@ -6,6 +6,7 @@ version = 4
 name = "actionlint"
 version = "1.0.0"
 dependencies = [
+ "chrono",
  "colored",
  "croner",
  "globset",
@@ -13,6 +14,7 @@ dependencies = [
  "rayon",
  "regex",
  "saphyr",
+ "saphyr-parser",
  "serde",
  "serde_json",
  "shellwords",

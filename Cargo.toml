@@ -17,6 +17,10 @@ path = "src/lib.rs"
 [dependencies]
 # YAML 1.2 parser exposing a position-aware node tree (counterpart of go.yaml.in/yaml/v4).
 saphyr = "0.3"
+# Low-level YAML event stream. `parse` builds a Go-style node tree from these events so it can
+# preserve source positions, scalar tags/styles, anchors, aliases and duplicate mapping keys
+# (which the higher-level `saphyr::Yaml` mapping would silently deduplicate).
+saphyr-parser = "0.3"
 # Golang template syntax for the --format option (counterpart of text/template).
 gtmpl = "0.7"
 # `**` glob matching for config `paths` (counterpart of bmatcuk/doublestar).
@@ -29,6 +33,10 @@ unicode-width = "0.2"
 shellwords = "1"
 # Standard 5-field cron parsing for `schedule` events (counterpart of robfig/cron).
 croner = "4"
+# Date/time arithmetic for computing the interval between the next cron fire times. croner's
+# `find_next_occurrence` needs a `CronDateTime` type and only its chrono/jiff backends implement
+# that trait; chrono is already compiled as croner's default backend, so this adds no new build.
+chrono = { version = "0.4", default-features = false }
 # Regular expressions for --ignore and config `ignore` patterns.
 regex = "1"
 # Data serialization for action metadata and JSON output.
@@ -73,3 +81,8 @@ redundant_else = "allow"
 manual_let_else = "allow"
 semicolon_if_nothing_returned = "allow"
 assigning_clones = "allow"
+# Test assertions use `assert!(x.is_empty())` / `assert!(!x.is_empty())` which read more naturally
+# than the `assert_eq!` form clippy suggests, and `BTreeMap::new()`/struct literals are preferred
+# over `::default()` throughout the port for consistency with the original Go map literals.
+assert_is_empty = "allow"
+default_trait_access = "allow"

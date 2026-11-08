@@ -262,7 +262,7 @@ fn read_local_action_metadata_file(dir: &Path) -> Option<(Vec<u8>, String)> {
 mod tests {
     use super::*;
 
-    const META: &str = r#"
+    const META: &str = r"
 name: My Action
 description: Does things
 inputs:
@@ -277,7 +277,7 @@ outputs:
 runs:
   using: node20
   main: dist/index.js
-"#;
+";
 
     #[test]
     fn parse_metadata() {

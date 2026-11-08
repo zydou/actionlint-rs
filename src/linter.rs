@@ -155,12 +155,27 @@ impl Linter {
 /// This is the counterpart of the `check` method in the original `Linter`.
 pub fn run_rules(
     workflow: &crate::ast::Workflow,
-    _path: &str,
-    _project: Option<&crate::project::Project>,
+    path: &str,
+    project: Option<&crate::project::Project>,
     opts: &LinterOptions,
 ) -> Result<Vec<Error>, String> {
     let mut visitor = crate::pass::Visitor::new();
     let mut rules: Vec<Box<dyn crate::rule::Rule>> = Vec::new();
+
+    // The `workflow-call` rule shares a reusable workflow cache with the linter so that a local
+    // reusable workflow is parsed at most once across the whole lint run.
+    let reusable_cache =
+        std::sync::Arc::new(crate::reusable_workflow::LocalReusableWorkflowCache::new(
+            project.cloned(),
+            PathBuf::from(path),
+            None,
+        ));
+
+    // The `action` rule shares a local action metadata cache so that a local action is read and
+    // parsed at most once across the whole lint run.
+    let actions_cache = std::sync::Arc::new(crate::action_metadata::LocalActionsCache::new(
+        project.map(|p| p.root_dir().to_path_buf()),
+    ));
 
     macro_rules! push {
         ($r:expr) => {
@@ -174,12 +189,15 @@ pub fn run_rules(
     push!(crate::rule_runner_label::RuleRunnerLabel::new());
     push!(crate::rule_events::RuleEvents::new());
     push!(crate::rule_job_needs::RuleJobNeeds::new());
-    push!(crate::rule_action::RuleAction::new());
+    push!(crate::rule_action::RuleAction::new(actions_cache));
     push!(crate::rule_env_var::RuleEnvVar::new());
     push!(crate::rule_id::RuleId::new());
     push!(crate::rule_glob::RuleGlob::new());
     push!(crate::rule_permissions::RulePermissions::new());
-    push!(crate::rule_workflow_call::RuleWorkflowCall::new());
+    push!(crate::rule_workflow_call::RuleWorkflowCall::new(
+        PathBuf::from(path),
+        reusable_cache,
+    ));
     push!(crate::rule_expression::RuleExpression::new());
     push!(crate::rule_deprecated_commands::RuleDeprecatedCommands::new());
     push!(crate::rule_if_cond::RuleIfCond::new());

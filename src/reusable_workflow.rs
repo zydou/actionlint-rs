@@ -431,7 +431,7 @@ impl Write for NullWrite {
 mod tests {
     use super::*;
 
-    const REUSABLE: &str = r#"
+    const REUSABLE: &str = r"
 on:
   workflow_call:
     inputs:
@@ -451,7 +451,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo
-"#;
+";
 
     #[test]
     fn parse_metadata() {
@@ -531,8 +531,7 @@ jobs:
         let proj = Project::new(tmp.clone()).unwrap();
         let c = LocalReusableWorkflowCache::new(Some(proj), tmp.clone(), None);
 
-        let mut inputs = Vec::new();
-        inputs.push(WorkflowCallEventInput {
+        let inputs = vec![WorkflowCallEventInput {
             name: String::at("my-input", Pos::new(1, 1)),
             description: None,
             default: None,
@@ -543,7 +542,7 @@ jobs:
             }),
             input_type: WorkflowCallEventInputType::String,
             id: "my-input".to_string(),
-        });
+        }];
         let mut secrets = BTreeMap::new();
         secrets.insert(
             "my-secret".to_string(),

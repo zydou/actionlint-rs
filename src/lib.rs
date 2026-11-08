@@ -30,6 +30,7 @@ pub mod pass;
 pub mod popular_actions;
 pub mod process;
 pub mod project;
+pub mod quotes;
 pub mod reusable_workflow;
 pub mod rule;
 pub mod rule_action;
