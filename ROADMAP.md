@@ -269,18 +269,18 @@ src/
 
 | 模块 | 说明 |
 | ---- | ---- |
-| `ast.rs` | workflow AST 节点（含位置信息） |
+| `ast.rs` | workflow AST 节点（含位置信息；`uses`/`secrets` 等携带 presence 标志以区分「未设置」与「设置为空」） |
 | `expr.rs` / `expr_ast.rs` / `expr_lexer.rs` / `expr_parser.rs` | 表达式词法/语法解析 |
 | `expr_type.rs` | 表达式类型系统（`ExprTypeKind`/`ObjectType` 等） |
 | `expr_insecure.rs` | 模板注入检测 |
-| `parse.rs`（进行中） | workflow YAML 解析器（位置感知） |
-| `expr_sema.rs`（进行中） | 表达式语义类型检查 |
-| `rule_*.rs`（除 `expression`/`if_cond`） | 15 条规则已移植并含单元测试 |
-| `error.rs` | 错误类型、`summary()`、`pretty_print`、`ErrorFormatter`、排序/去重 |
+| `parse.rs` | workflow YAML 解析器（位置感知；块标量/空标量/anchor 位置与 go-yaml 对齐） |
+| `expr_sema.rs` | 表达式语义类型检查（context/function 可用性、matrix/inputs 严格性） |
+| `rule_*.rs` | 全部 17 条规则已移植并含单元测试（含 `rule_expression`、`rule_if_cond`） |
+| `error.rs` | 错误类型、`summary()`、`pretty_print`、`ErrorFormatter`（`--format` Go template，含 vendored+patched `gtmpl`）、排序/去重 |
 | `linter.rs` | 编排：配置加载、ignore 过滤、规则运行、两种输出 |
 | `command.rs` | CLI 参数解析、退出码、init-config、version |
 | `config.rs` / `project.rs` | 配置解析、项目定位 |
-| `glob.rs` | `path_match`（Go `path.Match` 移植）、glob 规则支持 |
+| `glob.rs` | `path_match`（Go `path.Match` 移植）、glob 规则支持（字符类/范围校验） |
 | `action_metadata.rs` / `reusable_workflow.rs` / `popular_actions.rs` | action 元数据、可复用 workflow、popular action 数据表 |
 | `availability.rs` / `all_webhooks.rs` | context 可用性、webhook payload 类型 |
 | `process.rs` | 外部命令并发执行 |
@@ -289,16 +289,16 @@ src/
 
 | 模块 | 阻塞点 |
 | ---- | ---- |
-| `expr_sema.rs` | 进行中（语义类型检查） |
-| `rule_expression.rs` | 依赖 `expr_sema.rs` |
-| `rule_if_cond.rs` | 依赖 `expr_sema.rs` |
-| `parse.rs` | 进行中（workflow 解析器） |
-| 集成 / 端到端测试 | 依赖 `parse.rs`（`testdata/{ok,err,examples}` fixture 驱动） |
-| 跨平台编译验证 | 依赖全部功能完成后用 `cross` 验证 musl、CI 验证 macOS |
+| 跨平台编译验证 | 功能已全部完成；待用 `cross` 验证 `x86_64-unknown-linux-musl`，macOS 两目标仅在 CI 验证 |
 
 ### 测试与质量状态
 
-- `cargo build --lib`：通过
-- `cargo test --lib`：255 通过
-- `cargo clippy --lib --all-features`：0 警告
-- `cargo fmt`：干净
+- `cargo build` / `cargo build --release --locked`：通过（二进制名 `actionlint`）
+- `cargo test`：全部测试目标通过 —— lib 333 通过、`config_test` 3 通过、`format_test` 2 通过、`linter_test` 集成 fixture（`testdata/{examples,err}` 共 146 个）全部匹配
+- `cargo clippy --all-targets --all-features`：0 警告
+- `cargo fmt --check`：干净
+- 退出码 0/1/2/3 已端到端验证
+
+### 已知内部差异（不影响可观测行为）
+
+- `expr_sema.rs` 保留了一个 `contexts_restricted` 标志，提供「未设置可用性时不过滤 context」的检查器模式。Go 的 `ExprSemanticsChecker` 无此模式（`availableContexts` 为空即视为 restrictive）。生产路径（`rule_expression.rs`）总是先调用 `set_context_availability`，因此该模式仅在直接构造检查器的单元测试中可达，不产生可观测的行为分歧。保留它是为了避免大面积改造约 35 个依赖该默认行为的 `expr_sema` 单元测试。
