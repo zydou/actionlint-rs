@@ -1,0 +1,29 @@
+# Vendored copy of gtmpl 0.7.1 (https://github.com/fiji-flo/gtmpl-rust, MIT license).
+#
+# Patched to support Go `text/template` variable REASSIGNMENT with `=` in addition to the
+# declaration form `:=` (e.g. `{{$first := true}}` ... `{{$first = false}}`). Upstream 0.7.1
+# only lexes/parses `:=`, so a bare `=` inside an action fails with "unexpected = in operand".
+# The real actionlint SARIF format template (testdata/format/sarif_template.txt) relies on `=`,
+# and vendoring is the only faithful way to support it without preprocessing the template.
+# Only the `src` of the original crate is kept; tests and the `gtmpl_derive` dev-dependency are
+# dropped because they are unused here.
+[package]
+name = "gtmpl"
+version = "0.7.1"
+edition = "2021"
+authors = ["Florian Dieminger <me@fiji-flo.de>"]
+description = "The Golang Templating Language for Rust (vendored, with `=` variable assignment)"
+license = "MIT"
+repository = "https://github.com/fiji-flo/gtmpl-rust"
+keywords = ["golang", "template", "templating"]
+categories = ["template-engine"]
+
+[dependencies]
+anyhow = "1"
+gtmpl_value = "0.5"
+lazy_static = "1"
+percent-encoding = "2"
+thiserror = "1"
+
+[features]
+gtmpl_dynamic_template = []

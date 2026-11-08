@@ -22,7 +22,10 @@ saphyr = "0.3"
 # (which the higher-level `saphyr::Yaml` mapping would silently deduplicate).
 saphyr-parser = "0.3"
 # Golang template syntax for the --format option (counterpart of text/template).
-gtmpl = "0.7"
+# This is a vendored copy of gtmpl 0.7.1 (see vendor/gtmpl/) patched to support Go's `=`
+# variable-reassignment operator, which the SARIF format template relies on. Upstream 0.7.1
+# only supports the `:=` declaration form.
+gtmpl = { path = "vendor/gtmpl" }
 # `**` glob matching for config `paths` (counterpart of bmatcuk/doublestar).
 globset = "0.4"
 # Colorful output honoring NO_COLOR / tty detection (counterpart of fatih/color).
@@ -37,11 +40,16 @@ croner = "4"
 # `find_next_occurrence` needs a `CronDateTime` type and only its chrono/jiff backends implement
 # that trait; chrono is already compiled as croner's default backend, so this adds no new build.
 chrono = { version = "0.4", default-features = false }
+# Embedded IANA tz database for validating `schedule.timezone` names (counterpart of Go's
+# `time.LoadLocation`). Validating that a name is a real zone requires the tz database; chrono-tz
+# (maintained by the chrono organization) is the standard, well-maintained provider.
+chrono-tz = "0.10"
 # Regular expressions for --ignore and config `ignore` patterns.
 regex = "1"
-# Data serialization for action metadata and JSON output.
+# Data serialization for action metadata and JSON output. `preserve_order` makes `Map` keep
+# insertion order (Go's encoding/json emits struct fields in declaration order, not sorted).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # Work-stealing parallelism for linting multiple files (counterpart of errgroup+semaphore).
 rayon = "1"
 # Ergonomic library error definitions.
