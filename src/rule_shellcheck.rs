@@ -67,7 +67,18 @@ impl RuleShellcheck {
         "bash".to_string()
     }
 
-    fn run_shellcheck(&mut self, src: &str, shell: &str, pos: crate::ast::Pos) {
+    /// Runs `shellcheck` on `src` and reports any issues as lint errors.
+    ///
+    /// A failure to execute `shellcheck` or to parse its JSON output is a **fatal** error (returned
+    /// as `Err`), mirroring the original where the run callback returns an error that propagates up
+    /// through the visitor and aborts the lint run (exit status 3) rather than being reported as a
+    /// per-position lint error.
+    fn run_shellcheck(
+        &mut self,
+        src: &str,
+        shell: &str,
+        pos: crate::ast::Pos,
+    ) -> Result<(), String> {
         let sh = if shell == "bash" || shell == "sh" {
             shell.to_string()
         } else if shell.starts_with("bash ") {
@@ -75,7 +86,7 @@ impl RuleShellcheck {
         } else if shell.starts_with("sh ") {
             "sh".to_string()
         } else {
-            return; // Skip checking this shell script since shellcheck doesn't support it
+            return Ok(()); // Skip checking this shell script since shellcheck doesn't support it
         };
 
         let src = sanitize_expressions_in_script(src);
@@ -123,33 +134,22 @@ impl RuleShellcheck {
                     "Command {} {args:?} failed: {e}",
                     self.executable
                 ));
-                self.base.error_at(
-                    pos,
-                    format!(
-                        "`{} {}` did not run successfully while checking script at {pos}: {e}",
-                        self.executable,
-                        args.join(" ")
-                    ),
-                );
-                return;
+                return Err(format!(
+                    "`{} {}` did not run successfully while checking script at {pos}: {e}",
+                    self.executable,
+                    args.join(" ")
+                ));
             }
         };
 
-        let errs: Vec<ShellcheckError> = match serde_json::from_slice(&stdout) {
-            Ok(e) => e,
-            Err(e) => {
-                self.base.error_at(
-                    pos,
-                    format!(
-                        "could not parse JSON output from shellcheck: {e}: stdout={:?}",
-                        String::from_utf8_lossy(&stdout)
-                    ),
-                );
-                return;
-            }
-        };
+        let errs: Vec<ShellcheckError> = serde_json::from_slice(&stdout).map_err(|e| {
+            format!(
+                "could not parse JSON output from shellcheck: {e}: stdout={:?}",
+                String::from_utf8_lossy(&stdout)
+            )
+        })?;
         if errs.is_empty() {
-            return;
+            return Ok(());
         }
 
         // It's better to show the source location in the script as the position of the error, but
@@ -170,6 +170,7 @@ impl RuleShellcheck {
                 ),
             );
         }
+        Ok(())
     }
 }
 
@@ -222,8 +223,7 @@ impl Pass for RuleShellcheck {
             return Ok(());
         };
         let shell = self.get_shell_name(run);
-        self.run_shellcheck(&run.run.value, &shell, run.run_pos);
-        Ok(())
+        self.run_shellcheck(&run.run.value, &shell, run.run_pos)
     }
 
     fn visit_job_pre(&mut self, n: &Job) -> Result<(), String> {

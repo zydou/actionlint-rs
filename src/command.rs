@@ -27,6 +27,10 @@ pub struct Command {
     stdout: Box<dyn Write>,
     stderr: Box<dyn Write>,
     stdin: Box<dyn Read>,
+    /// Writer for `-verbose` / `-debug` diagnostic output (the original's `opts.LogWriter`).
+    /// Kept separate from `stderr` because the linter borrows `stdout` for results, while the log
+    /// stream is independent.
+    log_writer: Option<Box<dyn Write + Send>>,
 }
 
 impl Command {
@@ -41,7 +45,14 @@ impl Command {
             stdout: Box::new(stdout),
             stderr: Box::new(stderr),
             stdin: Box::new(stdin),
+            log_writer: None,
         }
+    }
+
+    /// Sets the writer that `-verbose` / `-debug` diagnostic output is sent to (the original's
+    /// `opts.LogWriter`). When unset, no diagnostic output is produced.
+    pub fn set_log_writer(&mut self, w: Box<dyn Write + Send>) {
+        self.log_writer = Some(w);
     }
 
     /// Runs the actionlint command with the given arguments (including the program name) and
@@ -224,6 +235,9 @@ Flags:
             config_file: cli.config_file.clone(),
             format: cli.format.clone(),
             stdin_file_name: cli.stdin_filename.clone(),
+            // `-verbose` / `-debug` diagnostics go to stderr, mirroring the original's
+            // `opts.LogWriter = cmd.Stderr`. Consumed by the `Linter` on construction.
+            log_writer: self.log_writer.take(),
         };
 
         // The `Linter` borrows this command's stdout for its lifetime, so error output keeps

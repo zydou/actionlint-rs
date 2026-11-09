@@ -4,6 +4,7 @@
 //! lifecycle: it locates the project, reads workflow files, parses them, runs the rules through a
 //! [`Visitor`](crate::pass::Visitor), filters the resulting errors, and writes them to the output.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, IgnorePatterns};
@@ -11,8 +12,9 @@ use crate::error::{Error, ErrorFormatter};
 
 /// Options controlling the behavior of the [`Linter`].
 ///
-/// This mirrors the original `LinterOptions`.
-#[derive(Debug, Clone, Default)]
+/// This mirrors the original `LinterOptions`. It is not `Clone`/`Debug` because it owns the
+/// `-verbose`/`-debug` log writer (a trait object), matching the original's `io.Writer` field.
+#[derive(Default)]
 pub struct LinterOptions {
     /// Enable verbose log output.
     pub verbose: bool,
@@ -34,6 +36,10 @@ pub struct LinterOptions {
     pub format: String,
     /// File name used when reading input from stdin.
     pub stdin_file_name: String,
+    /// Writer for `-verbose` / `-debug` diagnostic output. The command wires this to stderr. When
+    /// `None` (or the level is `None`) no diagnostic output is produced. Counterpart of the
+    /// original's `LogWriter`.
+    pub log_writer: Option<Box<dyn std::io::Write + Send>>,
 }
 
 /// Lints GitHub Actions workflow files.
@@ -42,6 +48,10 @@ pub struct LinterOptions {
 /// of the stream (mirroring the original `Linter` holding an `io.Writer`).
 pub struct Linter<'a> {
     out: &'a mut dyn std::io::Write,
+    /// Writer for `-verbose` / `-debug` diagnostic output. The command wires this to stderr.
+    log_out: Option<Box<dyn std::io::Write + Send>>,
+    /// Verbosity of diagnostic output. `None`-equivalent is [`LogLevel::None`].
+    log_level: LogLevel,
     opts: LinterOptions,
     /// The name used for stdin input in error messages.
     stdin_name: String,
@@ -53,19 +63,51 @@ pub struct Linter<'a> {
     err_fmt: Option<ErrorFormatter>,
 }
 
+/// Verbosity of `-verbose` / `-debug` diagnostic output. Counterpart of the original `LogLevel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    /// No diagnostic output.
+    None,
+    /// `-verbose`: high-level progress lines.
+    Verbose,
+    /// `-debug`: all output including per-rule and per-file detail.
+    Debug,
+}
+
 impl<'a> Linter<'a> {
     /// Creates a new `Linter` writing errors to `out` and configured with `opts`.
     ///
     /// Returns an error when an `--ignore` pattern is not a valid regular expression, the
     /// `-config-file` cannot be read/parsed, or the `--format` template is invalid.
-    pub fn new(out: &'a mut dyn std::io::Write, opts: LinterOptions) -> Result<Self, String> {
-        // Honor the explicit color choice; leave the `colored` crate to auto-detect from the
-        // environment (`NO_COLOR`, tty) when no option is given.
-        match opts.color {
-            Some(false) => colored::control::set_override(false),
-            Some(true) => colored::control::set_override(true),
-            None => colored::control::unset_override(),
-        }
+    pub fn new(out: &'a mut dyn std::io::Write, mut opts: LinterOptions) -> Result<Self, String> {
+        // Decide whether to colorize using the original's exact behavior and force it onto the
+        // `colored` crate. We must not let `colored` consult the environment itself: it honors
+        // `CLICOLOR_FORCE`/`CLICOLOR` (which Go's `fatih/color` ignores) and orders the checks
+        // differently. Emulating `fatih/color` + the `Linter` color option keeps the two builds
+        // byte-identical:
+        //
+        // - `color.New` (run at package init for every color used in `error.go`) captures
+        //   `NO_COLOR != ""` into a per-Color `noColor = true`. `isNoColorSet` checks that pointer
+        //   BEFORE the package default, so once `NO_COLOR` is set no `-color` flag can re-enable
+        //   color — it is a hard veto.
+        // - `-no-color` (`Never`) and `-color` (`Always`) set the package-level `color.NoColor`,
+        //   which only applies when the per-Color pointer is unset (i.e. `NO_COLOR` absent).
+        // - With no flag (`Auto`) the package default `NO_COLOR != "" || TERM == "dumb" || stdout
+        //   is not a TTY` applies; since `NO_COLOR` was already handled as a veto, only `TERM` and
+        //   the TTY check remain.
+        let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+        let colorize = if no_color_env {
+            false
+        } else {
+            match opts.color {
+                Some(c) => c,
+                None => {
+                    std::env::var("TERM").as_deref() != Ok("dumb")
+                        && std::io::stdout().is_terminal()
+                }
+            }
+        };
+        colored::control::set_override(colorize);
 
         let stdin_name = if opts.stdin_file_name.is_empty() {
             "<stdin>".to_string()
@@ -94,14 +136,65 @@ impl<'a> Linter<'a> {
             Some(ErrorFormatter::new(&opts.format)?)
         };
 
+        let log_level = if opts.debug {
+            LogLevel::Debug
+        } else if opts.verbose {
+            LogLevel::Verbose
+        } else {
+            LogLevel::None
+        };
+        let log_out = opts.log_writer.take();
+        let log_level = if log_out.is_some() {
+            log_level
+        } else {
+            LogLevel::None
+        };
+
         Ok(Self {
             out,
+            log_out,
+            log_level,
             opts,
             stdin_name,
             ignore_pats: IgnorePatterns(pats),
             default_config,
             err_fmt,
         })
+    }
+
+    /// Writes a `-verbose` progress line (`verbose: ...`) to the log writer when the log level is
+    /// [`LogLevel::Verbose`] or higher. Counterpart of the original `Linter.log`. No-op when
+    /// neither `-verbose` nor `-debug` was given.
+    fn log(&mut self, args: std::fmt::Arguments<'_>) {
+        if self.log_level < LogLevel::Verbose {
+            return;
+        }
+        if let Some(w) = self.log_out.as_mut() {
+            let _ = writeln!(w, "verbose: {args}");
+        }
+    }
+
+    /// Writes a `-debug` line (`[Linter] ...`) to the log writer when the log level is
+    /// [`LogLevel::Debug`]. Counterpart of the original `Linter.debug`.
+    fn debug(&mut self, args: std::fmt::Arguments<'_>) {
+        if self.log_level < LogLevel::Debug {
+            return;
+        }
+        if let Some(w) = self.log_out.as_mut() {
+            let _ = writeln!(w, "[Linter] {args}");
+        }
+    }
+
+    /// Returns the writer that per-rule debug output should be sent to, or `None` when the log
+    /// level is below [`LogLevel::Debug`]. Counterpart of the original `Linter.debugWriter`.
+    #[must_use]
+    pub fn debug_writer(&mut self) -> Option<&mut dyn std::io::Write> {
+        if self.log_level < LogLevel::Debug {
+            return None;
+        }
+        self.log_out
+            .as_mut()
+            .map(|w| &mut **w as &mut dyn std::io::Write)
     }
 
     /// Creates a new `Linter` like [`Linter::new`], but with an explicit default config that takes
@@ -123,6 +216,7 @@ impl<'a> Linter<'a> {
     /// Lints the workflow content read from stdin.
     pub fn lint_stdin(&mut self, content: &str) -> Result<Vec<Error>, String> {
         let name = self.stdin_name.clone();
+        self.log(format_args!("Reading the input from stdin"));
         self.lint(&name, content.as_bytes(), None)
     }
 
@@ -134,12 +228,20 @@ impl<'a> Linter<'a> {
         } else {
             PathBuf::from(dir)
         };
+        self.log(format_args!(
+            "Linting all workflow files in repository: {}",
+            start.display()
+        ));
         let project = crate::project::find_project(&start)?.ok_or_else(|| {
             format!(
                 "no project was found in any parent directories of {}",
                 start.display()
             )
         })?;
+        self.log(format_args!(
+            "Detected project: {}",
+            project.root_dir().display()
+        ));
         let workflows = project.workflows_dir();
         self.lint_dir(&workflows, Some(project))
     }
@@ -157,6 +259,7 @@ impl<'a> Linter<'a> {
         collect_workflow_files(dir, &mut files)
             .map_err(|e| format!("could not read files in {}: {e}", dir.display()))?;
         files.sort();
+        self.log(format_args!("Collected {} YAML files", files.len()));
         if files.is_empty() {
             return Err(format!("no YAML file was found in {}", dir.display()));
         }
@@ -172,6 +275,9 @@ impl<'a> Linter<'a> {
         paths: &[PathBuf],
         project: Option<crate::project::Project>,
     ) -> Result<Vec<Error>, String> {
+        let n = paths.len();
+        self.log(format_args!("Linting {n} files"));
+
         // Phase 1: resolve each file's project and read its content. Any failure aborts before any
         // output is produced, matching the original's `errgroup.Wait()` after all reads.
         let mut contents: Vec<(PathBuf, String, Option<crate::project::Project>)> =
@@ -220,6 +326,8 @@ impl<'a> Linter<'a> {
             }
             all.extend(errs);
         }
+
+        self.log(format_args!("Found {} errors in {n} files", all.len()));
 
         if let Some(fmt) = &self.err_fmt {
             fmt.print(&mut *self.out, &fields)?;
@@ -282,6 +390,14 @@ impl<'a> Linter<'a> {
             Some(c) => Some(c.clone()),
             None => project.and_then(|p| p.config().cloned()),
         };
+        self.log(format_args!("Linting {path}"));
+        if let Some(p) = project {
+            self.log(format_args!("Using project at {}", p.root_dir().display()));
+        }
+        match &config {
+            Some(c) => self.debug(format_args!("Config: {c:?}")),
+            None => self.debug(format_args!("No config was found")),
+        }
 
         let (workflow, mut all) = crate::parse::parse(content);
 
@@ -354,10 +470,12 @@ fn collect_workflow_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result
 }
 
 /// Computes `path` relative to the current working directory, matching the original's use of
-/// `filepath.Rel(cwd, path)`. Already-relative paths are returned unchanged, and a path that cannot
-/// be made relative to the current directory (e.g. it lives outside it) falls back to its original
-/// form. This keeps error messages and `paths` config matching aligned with the original, which
-/// reports and matches against cwd-relative paths.
+/// `filepath.Rel(cwd, path)`. Already-relative paths are resolved against the current directory
+/// first (as `filepath.Rel` receives an absolute `cwd` and an absolute or relative target). When
+/// no relative form can be computed the original-form `path` is returned. This keeps error
+/// messages and `paths` config matching aligned with the original, which reports and matches
+/// against cwd-relative paths — including `../` upward traversal when the target lives outside
+/// the current directory.
 fn relativize_to_cwd(path: &Path) -> String {
     let display = path.to_string_lossy().into_owned();
     let Ok(cwd) = std::env::current_dir() else {
@@ -368,10 +486,50 @@ fn relativize_to_cwd(path: &Path) -> String {
     } else {
         cwd.join(path)
     };
-    match abs.strip_prefix(&cwd) {
-        Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => display,
+    match filepath_rel(&cwd, &abs) {
+        Some(rel) => rel,
+        None => display,
     }
+}
+
+/// Faithful port of Go's `filepath.Rel(basepath, targpath)` for absolute Unix paths.
+///
+/// Returns the lexical path of `targpath` relative to `basepath`, using `..` to traverse up out of
+/// `basepath` when the target is not a descendant. Returns `None` only when a component cannot be
+/// made relative (not reachable for two absolute paths). Mirrors `filepath.Rel`, which cleans both
+/// inputs (so trailing separators are ignored and `.` components are skipped) before stripping the
+/// common prefix.
+fn filepath_rel(basepath: &Path, targpath: &Path) -> Option<String> {
+    let base: Vec<_> = basepath.components().collect();
+    let targ: Vec<_> = targpath.components().collect();
+
+    // Strip the common prefix.
+    let mut common = 0;
+    while common < base.len()
+        && common < targ.len()
+        && base[common].as_os_str() == targ[common].as_os_str()
+    {
+        common += 1;
+    }
+
+    // `..` for every remaining base component, then the remaining target components.
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for _ in common..base.len() {
+        parts.push("..".into());
+    }
+    for c in &targ[common..] {
+        parts.push(c.as_os_str().to_os_string());
+    }
+
+    if parts.is_empty() {
+        return Some(".".to_string());
+    }
+    // `Path::push` on the first element absorbs a preceding `/`, keeping the result relative.
+    let mut rel = PathBuf::new();
+    for p in &parts {
+        rel.push(p);
+    }
+    Some(rel.to_string_lossy().into_owned())
 }
 
 /// Runs all rules against the parsed workflow, returning the errors found by the rules (not

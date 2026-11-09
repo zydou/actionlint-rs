@@ -248,13 +248,29 @@ paths:
 "#;
 
 /// Writes the default config file to the given path.
+///
+/// Mirrors Go's `os.WriteFile(path, b, 0644)`: a newly created file gets mode `0644` (further
+/// restricted by the process umask). Rust's `std::fs::write` would create it `0666 & ~umask`
+/// (group-writable under a permissive umask), so the mode is set explicitly after writing.
 pub fn write_default_config_file(path: &Path) -> Result<(), String> {
     std::fs::write(path, DEFAULT_CONFIG).map_err(|e| {
         format!(
             "could not write default configuration file at {}: {e}",
             path.display()
         )
-    })
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o644);
+        if let Err(e) = std::fs::set_permissions(path, perms) {
+            return Err(format!(
+                "could not set permissions on default configuration file at {}: {e}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -34,9 +34,13 @@ impl Project {
     }
 
     /// Returns whether the project knows the given file (i.e. the file is inside the project root).
+    ///
+    /// Mirrors the original's `strings.HasPrefix(absPath(path), p.root)` string-prefix check: both
+    /// sides are made absolute lexically (no symlink resolution) before comparing.
     #[must_use]
     pub fn knows(&self, path: &Path) -> bool {
-        path.starts_with(&self.root)
+        let abs = abs_path(path);
+        abs.starts_with(&self.root)
     }
 
     /// Returns the config object read from `.github/actionlint.yaml`, if any.
@@ -46,9 +50,21 @@ impl Project {
     }
 }
 
-/// Returns the canonical absolute path of the given path, if possible.
+/// Returns the absolute path of the given path without resolving symlinks.
+///
+/// Mirrors the original's `absPath` (`filepath.Abs`), which is purely lexical: it joins a relative
+/// `path` onto the current directory and cleans the result, but never resolves symbolic links.
+/// Using `std::fs::canonicalize` here instead would resolve symlink components, which can make the
+/// project-root walk-up (`findProject`) stop at a different directory than the original on layouts
+/// where a symlink crosses a repository boundary (e.g. macOS `/tmp -> /private/tmp`).
 fn abs_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Finds the project which the given path belongs to by walking up the directory tree.

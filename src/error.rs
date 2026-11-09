@@ -147,7 +147,9 @@ impl Error {
         let lnum = format!("{} | ", self.line);
         let indent = " ".repeat(lnum.len().saturating_sub(2));
         let _ = writeln!(w, "{}|", indent.bright_black());
-        let _ = writeln!(w, "{}", lnum.bright_black());
+        // Go prints the line-number gutter with `Fprint` (no trailing newline) so the source line
+        // shares the same physical line as the gutter. Using `writeln!` here would split them.
+        let _ = write!(w, "{}", lnum.bright_black());
         let _ = writeln!(w, "{line}");
         let indicator = self.get_indicator(line).unwrap_or_default();
         let _ = write!(w, "{}| ", indent.bright_black());
