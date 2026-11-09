@@ -1,19 +1,25 @@
 ---
-# Release pipeline: format check, static analysis, tests, then one binary per
-# (platform, ABI) pair attached to the GitHub Release of the pushed tag.
+# Release pipeline: format check, static analysis, then one self-contained job per
+# (platform, ABI) pair that tests, builds, and attaches its own binary to the GitHub
+# Release of the pushed tag.
 
-# A single workflow gates a release on a green build: the `lint` and `test-*` jobs run on
-# every push, pull request, and dispatch, and the `build` job — which packages and publishes
-# the binaries — runs only after all of them pass. A pull request therefore gets the full
-# lint/test feedback loop but never publishes.
+# Every target runs as a single job that first tests and then builds. Because both halves
+# share one runner, the cross toolchain image is pulled at most once per target: `cross`
+# finds the image locally on the build step and skips the registry pull it already did for
+# the test step. A target publishes its artifact only when its own test AND build both
+# succeed and the run was not triggered by a pull request — a pull request gets the full
+# lint/test feedback loop but never builds or publishes.
 
 # Linux targets go through cross-rs so the binary comes out of a fixed toolchain image instead of whatever the runner ships.
 # The macOS targets build natively — `x86_64-apple-darwin` on an Intel runner, `aarch64-apple-darwin` on the arm64 one.
 
 # Trigger: every push. A `v*` tag releases to that tag;
 # any branch push releases to `nightly`, so the latest main build is always published.
-# Pull requests run lint + tests only (the `build` job is event-gated) for fast feedback.
+# Pull requests run lint + tests only for fast feedback.
 # `workflow_dispatch` builds the checked-out ref and attaches it to the release named by the `release` input (default `nightly`)
+
+# Note: releases are per-target, not atomic. If one target fails on a push, the targets
+# that succeeded still publish, and the failed one is simply absent from that release.
 
 name: Release
 
@@ -45,7 +51,8 @@ env:
 
 jobs:
   lint:
-    # Format and static analysis are host-independent, so run them once.
+    # Format and static analysis are host-independent, so run them once. Every target job
+    # depends on this so a broken build never wastes a cross-image pull.
     name: fmt & clippy
     runs-on: ubuntu-latest
     steps:
@@ -65,79 +72,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-  test-linux:
-    name: test (${{ matrix.target }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The host target runs natively: fastest path to unit + integration tests.
-          - target: x86_64-unknown-linux-gnu
-            cross: false
-          # The required musl target runs through cross so it is tested, not just compiled.
-          - target: x86_64-unknown-linux-musl
-            cross: true
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install Cross
-        if: ${{ matrix.cross }}
-        # The pre-built cross binary rather than `cargo install cross`, which spends ~5 min
-        # compiling a tool the job uses once.
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          curl -L --proto '=https' --tlsv1.2 -sSf \
-            https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xzf - -C "$HOME/.cargo/bin"
-          echo "CARGO=cross" >> "$GITHUB_ENV"
-
-      - name: cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: cargo test
-        run: ${{ env.CARGO }} test --locked --target ${{ matrix.target }}
-
-  test-macos:
-    name: test (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-26-intel
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: cargo test
-        run: cargo test --locked --target ${{ matrix.target }}
-
-  build:
-    # Publishes only once the code is known good: lint and every platform's tests must pass.
-    # Pull requests stop here — they get the checks above without publishing anything.
+  target:
+    # One job per (platform, ABI) pair: test it, build it, publish it. Test and build share
+    # the runner so the cross toolchain image is pulled once and reused across both steps.
     name: ${{ matrix.target }}
-    needs: [lint, test-linux, test-macos]
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    needs: [lint]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -161,36 +100,60 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             cross: false
+    env:
+      # Linux targets drive cargo through cross; macOS targets build natively.
+      CARGO: ${{ matrix.cross && 'cross' || 'cargo' }}
     steps:
       - uses: actions/checkout@v7
 
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
-      - name: Install Cross
-        # The pre-built cross binary rather than `cargo install cross`, which spends ~5 min compiling a tool the job uses once.
+      # Cache the pre-built `cross` binary so a green path skips the release download.
+      - name: Restore cross
         if: ${{ matrix.cross }}
+        uses: actions/cache@v6
+        with:
+          path: ~/.cross
+          key: cross-v0.2.5-x86_64
+
+      - name: Install cross
+        if: ${{ matrix.cross && steps.cache-cross.outputs.cache-hit != 'true' }}
+        # The pre-built cross binary rather than `cargo install cross`, which spends ~5 min
+        # compiling a tool the job uses once. Only downloads on a cache miss.
         run: |
-          mkdir -p "$HOME/.cargo/bin"
+          mkdir -p "$HOME/.cross"
           curl -L --proto '=https' --tlsv1.2 -sSf \
             https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz \
-            | tar -xzf - -C "$HOME/.cargo/bin"
-          echo "CARGO=cross" >> "$GITHUB_ENV"
+            | tar -xzf - -C "$HOME/.cross"
 
+      - name: Add cross to PATH
+        if: ${{ matrix.cross }}
+        run: echo "$HOME/.cross" >> "$GITHUB_PATH"
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test ${{ matrix.target }}
+        run: ${{ env.CARGO }} test --locked --target ${{ matrix.target }}
+
+      # Everything below is skipped on pull requests: they get the test signal above
+      # without building or publishing anything.
       - name: Build release binary
-        run: |
-          rustup update
-          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }}
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+        run: ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }}
 
       - name: Package ${{ matrix.target }}
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         run: |
           cd "target/${{ matrix.target }}/release"
           tar -cJf "actionlint-${{ matrix.target }}.tar.xz" actionlint
           mv "actionlint-${{ matrix.target }}.tar.xz" "$GITHUB_WORKSPACE/"
 
       - name: Release
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
         env:
           # A tag push releases that tag; a dispatch releases to the name given in the `release` input;
           # any other push releases to nightly.
@@ -199,7 +162,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
-          files: actionlint-*.tar.xz
+          files: actionlint-${{ matrix.target }}.tar.xz
           # A nightly build is a moving target, not a real release: keep it
           # from being marked as the repo's "Latest" so it never shadows the
           # latest `v*` tag. Only tag pushes are the official latest.
