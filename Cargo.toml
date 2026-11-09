@@ -1,6 +1,6 @@
 [package]
 name = "actionlint"
-version = "1.0.0"
+version = "1.7.12"
 edition = "2024"
 description = "A Rust reimplementation of the actionlint."
 license = "MIT"
