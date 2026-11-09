@@ -257,6 +257,10 @@ struct Cli {
     debug: bool,
     oneline: bool,
     color: Option<bool>,
+    /// `-color` was given. Combined with `no_color` to compute `color`.
+    color_set: bool,
+    /// `-no-color` was given. Always overrides `color`, matching the original.
+    no_color: bool,
     shellcheck: String,
     pyflakes: String,
     ignore: Vec<String>,
@@ -271,7 +275,137 @@ enum ParseError {
     Invalid(String),
 }
 
-/// Parses command line arguments into a [`Cli`] struct.
+/// Parses a boolean flag value with Go's `strconv.ParseBool` semantics.
+///
+/// Accepts `1`/`t`/`T`/`TRUE`/`true`/`True` and `0`/`f`/`F`/`FALSE`/`false`/`False`. Returns
+/// `None` for any other value, which the caller reports as an invalid boolean flag (exit code 2).
+fn parse_go_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// The result of attempting to parse a single flag from the argument list.
+enum OneFlag {
+    /// A flag was consumed; keep parsing.
+    Seen,
+    /// Parsing stops here. The remaining arguments (including the one that triggered the stop,
+    /// except a consumed `--` terminator) become positional.
+    Stop,
+}
+
+/// Parses one flag from the front of `it`, mirroring Go's `flag.FlagSet.parseOne`.
+///
+/// Returns [`OneFlag::Seen`] when a flag was recognized and consumed. Returns
+/// [`OneFlag::Stop`] when a non-flag argument or `--` terminator is reached, in which case the
+/// remaining arguments (including the stopping one, unless `consumed` is `true`) become positional.
+/// Returns `Err` for an undefined flag, a missing flag value, or an invalid boolean value, matching
+/// the Go `flag` package's error messages (which the original reports with exit code 2).
+fn parse_one(
+    it: &mut std::slice::Iter<'_, OsString>,
+    cli: &mut Cli,
+) -> Result<OneFlag, ParseError> {
+    let Some(s) = it.as_slice().first() else {
+        return Ok(OneFlag::Stop);
+    };
+    let s = s.to_string_lossy().into_owned();
+
+    // A lone `-` or any argument not starting with `-` is not a flag: parsing stops and this
+    // argument stays in the positional list (Go leaves it in `f.args`).
+    if s.len() < 2 || !s.starts_with('-') {
+        return Ok(OneFlag::Stop);
+    }
+
+    let rest = &s[1..];
+    if let Some(after) = rest.strip_prefix('-') {
+        // `--` (exactly two dashes) terminates flag parsing and is itself consumed.
+        if after.is_empty() {
+            it.next();
+            return Ok(OneFlag::Stop);
+        }
+    }
+
+    let mut name = rest.to_string();
+    let mut inline_value: Option<String> = None;
+    if let Some(eq) = name.find('=') {
+        inline_value = Some(name[eq + 1..].to_string());
+        name.truncate(eq);
+    }
+    if name.is_empty() || name.starts_with('-') || name.starts_with('=') {
+        return Err(ParseError::Invalid(format!("bad flag syntax: {s}")));
+    }
+
+    // Consume the flag token now that we know it is a flag.
+    it.next();
+
+    let is_bool = matches!(
+        name.as_str(),
+        "version" | "init-config" | "verbose" | "debug" | "oneline" | "no-color" | "color"
+    );
+
+    if name == "h" || name == "help" {
+        return Err(ParseError::Help);
+    }
+
+    // For a boolean flag the inline value is optional and must be a valid bool; without one the
+    // flag is set to true. For a string flag a missing value falls back to the next argument.
+    let value = if is_bool {
+        match inline_value {
+            Some(v) => match parse_go_bool(&v) {
+                Some(b) => b.to_string(),
+                None => {
+                    return Err(ParseError::Invalid(format!(
+                        "invalid boolean value {v:?} for -{name}"
+                    )));
+                }
+            },
+            None => "true".to_string(),
+        }
+    } else if let Some(v) = inline_value {
+        v
+    } else {
+        match it.next() {
+            Some(v) => v.to_string_lossy().into_owned(),
+            None => {
+                return Err(ParseError::Invalid(format!(
+                    "flag needs an argument: -{name}"
+                )));
+            }
+        }
+    };
+
+    match name.as_str() {
+        "version" => cli.version = value == "true",
+        "init-config" => cli.init_config = value == "true",
+        "verbose" => cli.verbose = value == "true",
+        "debug" => cli.debug = value == "true",
+        "oneline" => cli.oneline = value == "true",
+        "no-color" => cli.no_color = value == "true",
+        "color" => cli.color_set = value == "true",
+        "ignore" => cli.ignore.push(value),
+        "shellcheck" => cli.shellcheck = value,
+        "pyflakes" => cli.pyflakes = value,
+        "config-file" => cli.config_file = value,
+        "format" => cli.format = value,
+        "stdin-filename" => cli.stdin_filename = value,
+        _ => {
+            return Err(ParseError::Invalid(format!(
+                "flag provided but not defined: -{name}"
+            )));
+        }
+    }
+    Ok(OneFlag::Seen)
+}
+
+/// Parses command line arguments into a [`Cli`] struct, replicating Go's `flag` package semantics.
+///
+/// Parsing stops at the first non-flag argument or at a `--` terminator; everything after that is
+/// treated as a positional file argument (and is not interpreted as a flag). Boolean flags accept
+/// an optional `=value` and string flags take the next argument when no `=value` is given, exactly
+/// like the original. `-no-color` always overrides `-color` regardless of their relative order,
+/// matching the original's color handling.
 fn parse_args(args: &[OsString]) -> Result<Cli, ParseError> {
     let mut cli = Cli {
         args: Vec::new(),
@@ -281,6 +415,8 @@ fn parse_args(args: &[OsString]) -> Result<Cli, ParseError> {
         debug: false,
         oneline: false,
         color: None,
+        color_set: false,
+        no_color: false,
         shellcheck: "shellcheck".to_string(),
         pyflakes: "pyflakes".to_string(),
         ignore: Vec::new(),
@@ -289,54 +425,22 @@ fn parse_args(args: &[OsString]) -> Result<Cli, ParseError> {
         stdin_filename: "<stdin>".to_string(),
     };
 
-    let mut it = args.iter().skip(1); // Skip program name
-    while let Some(arg) = it.next() {
-        let arg = arg.to_string_lossy();
-        if !arg.starts_with('-') {
-            cli.args.push(arg.into_owned());
-            continue;
-        }
-        if arg == "-" {
-            cli.args.push("-".to_string());
-            continue;
-        }
+    let mut it = args[1..].iter(); // Skip program name
+    // Each `parse_one` consumes exactly one flag; stop at the first non-flag (or `--`), leaving the
+    // iterator positioned at the remaining positional arguments.
+    while let OneFlag::Seen = parse_one(&mut it, &mut cli)? {}
+    cli.args
+        .extend(it.map(|a| a.to_string_lossy().into_owned()));
 
-        let (name, inline_value) = match arg.split_once('=') {
-            Some((n, v)) => (n.trim_start_matches('-').to_string(), Some(v.to_string())),
-            None => (arg.trim_start_matches('-').to_string(), None),
-        };
-
-        let mut value = || -> Result<String, ParseError> {
-            if let Some(v) = &inline_value {
-                return Ok(v.clone());
-            }
-            it.next()
-                .map(|v| v.to_string_lossy().into_owned())
-                .ok_or_else(|| ParseError::Invalid(format!("flag needs an argument: -{name}")))
-        };
-
-        match name.as_str() {
-            "h" | "help" => return Err(ParseError::Help),
-            "version" => cli.version = true,
-            "init-config" => cli.init_config = true,
-            "verbose" => cli.verbose = true,
-            "debug" => cli.debug = true,
-            "oneline" => cli.oneline = true,
-            "no-color" => cli.color = Some(false),
-            "color" => cli.color = Some(true),
-            "ignore" => cli.ignore.push(value()?),
-            "shellcheck" => cli.shellcheck = value()?,
-            "pyflakes" => cli.pyflakes = value()?,
-            "config-file" => cli.config_file = value()?,
-            "format" => cli.format = value()?,
-            "stdin-filename" => cli.stdin_filename = value()?,
-            _ => {
-                return Err(ParseError::Invalid(format!(
-                    "provided flag is not defined: -{name}"
-                )));
-            }
-        }
-    }
+    // `-no-color` wins over `-color` no matter which appears first, mirroring the original where
+    // the `noColor` check runs after the `color` check.
+    cli.color = if cli.no_color {
+        Some(false)
+    } else if cli.color_set {
+        Some(true)
+    } else {
+        None
+    };
 
     Ok(cli)
 }
@@ -388,6 +492,79 @@ mod tests {
     fn parse_help() {
         let args: Vec<OsString> = ["actionlint", "-h"].iter().map(OsString::from).collect();
         assert!(matches!(parse_args(&args), Err(ParseError::Help)));
+    }
+
+    #[test]
+    fn stops_at_first_positional() {
+        // Go's flag package stops parsing at the first non-flag argument, so `-version` here is a
+        // file name, not a flag.
+        let args: Vec<OsString> = ["actionlint", "foo.yaml", "-version"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let cli = parse_args(&args).unwrap();
+        assert_eq!(
+            cli.args,
+            vec!["foo.yaml".to_string(), "-version".to_string()]
+        );
+        assert!(!cli.version);
+    }
+
+    #[test]
+    fn dashdash_terminates_parsing() {
+        // `--` is consumed and everything after it becomes positional.
+        let args: Vec<OsString> = ["actionlint", "--", "-version"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let cli = parse_args(&args).unwrap();
+        assert_eq!(cli.args, vec!["-version".to_string()]);
+        assert!(!cli.version);
+    }
+
+    #[test]
+    fn bool_flag_inline_value() {
+        // Boolean flags accept an `=value` suffix, parsed with strconv.ParseBool semantics.
+        let mk = |a: &str| parse_args(&[OsString::from("actionlint"), OsString::from(a)]).unwrap();
+        assert!(!mk("-color=false").color_set);
+        assert!(mk("-color=true").color_set);
+        assert!(mk("-color=1").color_set);
+        assert!(mk("-color=t").color_set);
+        assert!(!mk("-oneline=0").oneline);
+        for bad in ["-color=notabool", "-version=x", "-verbose=2"] {
+            let args: Vec<OsString> = ["actionlint", bad].iter().map(OsString::from).collect();
+            assert!(
+                matches!(parse_args(&args), Err(ParseError::Invalid(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_color_overrides_color() {
+        // `-no-color` always wins over `-color`, regardless of the order they appear in.
+        let mk = |a: &[&str]| {
+            let mut v = vec![OsString::from("actionlint")];
+            v.extend(a.iter().map(OsString::from));
+            parse_args(&v).unwrap().color
+        };
+        assert_eq!(mk(&["-no-color", "-color"]), Some(false));
+        assert_eq!(mk(&["-color", "-no-color"]), Some(false));
+        assert_eq!(mk(&["-color"]), Some(true));
+        assert_eq!(mk(&["-no-color"]), Some(false));
+        assert_eq!(mk(&[]), None);
+    }
+
+    #[test]
+    fn string_flag_takes_next_arg() {
+        // A string flag consumes the next argument even if it looks like a flag, matching Go.
+        let args: Vec<OsString> = ["actionlint", "-format", "-color"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let cli = parse_args(&args).unwrap();
+        assert_eq!(cli.format, "-color");
+        assert!(!cli.color_set);
     }
 
     #[test]

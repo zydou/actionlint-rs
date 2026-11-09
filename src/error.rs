@@ -4,9 +4,10 @@
 //! workflow file. Errors can be pretty-printed with a source snippet, or rendered through a Go
 //! template via [`ErrorFormatter`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
-use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use colored::Colorize;
 use unicode_width::UnicodeWidthChar;
@@ -290,6 +291,11 @@ impl ErrorFormatter {
             format!("template {format:?} to format error messages could not be parsed: {e}")
         })?;
 
+        // The formatter starts with only the built-in `syntax-check` kind registered, matching the
+        // original `NewErrorFormatter`. Every other rule is registered later, when the linter
+        // constructs and runs its rules ([`ErrorFormatter::register_rule`]): the built-in rules are
+        // always added, while the external `pyflakes` / `shellcheck` kinds appear only when those
+        // commands are enabled and resolvable — exactly mirroring the original.
         let mut rules = std::collections::BTreeMap::new();
         rules.insert(
             "syntax-check".to_string(),
@@ -298,6 +304,7 @@ impl ErrorFormatter {
                 description: "Checks for GitHub Actions workflow syntax".to_string(),
             },
         );
+        set_registered_kinds(&rules);
 
         Ok(Self {
             template,
@@ -306,16 +313,24 @@ impl ErrorFormatter {
     }
 
     /// Renders the given template fields and writes the result to `out`.
+    ///
+    /// Mirrors the original's behavior on template *execution* failures: the error is swallowed and
+    /// whatever the template wrote before failing is kept. The original's `ErrorFormatter.Print`
+    /// returns the `text/template` execution error, but the linter discards it and still exits with
+    /// the "problems found" status, so a bad expression inside an otherwise parseable template
+    /// never turns into a fatal error.
     pub fn print(&self, out: &mut dyn Write, fields: &[ErrorTemplateFields]) -> Result<(), String> {
         // Build the template context with PascalCase keys so templates can access fields as
         // `{{.Filepath}}`, matching the original Go struct field names.
         let arr: Vec<gtmpl::Value> = fields.iter().map(field_to_gtmpl).collect();
         let ctx = gtmpl::Context::from(gtmpl::Value::Array(arr));
-        let rendered = self
-            .template
-            .render(&ctx)
-            .map_err(|e| format!("could not format error messages: {e}"))?;
-        let _ = out.write_all(rendered.as_bytes());
+        let mut buf = Vec::new();
+        // Template *execution* errors are non-fatal, matching the original: `text/template` writes
+        // whatever was rendered before the error and keeps the error internal to the writer, so the
+        // partial output is printed and the exit status still reflects the lint result. Only
+        // template *parse* errors (caught in `ErrorFormatter::new`) are fatal.
+        let _ = self.template.execute(&mut buf, &ctx);
+        out.write_all(&buf).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -330,8 +345,7 @@ impl ErrorFormatter {
         self.print(out, &fields)
     }
 
-    /// Registers a rule so its name and description are available to format templates via the
-    /// `kindDescription` / `kindIndex` helpers.
+    /// Registers a rule so its name and description are available to the `allKinds` format helper.
     pub fn register_rule(&self, rule: &dyn Rule) {
         let mut rules = self.rules.lock().expect("rules mutex poisoned");
         rules
@@ -340,20 +354,23 @@ impl ErrorFormatter {
                 name: rule.name().to_string(),
                 description: rule.description().to_string(),
             });
+        set_registered_kinds(&rules);
     }
 }
 
 /// The error template fields in their canonical (struct declaration) order, matching the json tags
 /// of the original Go `ErrorTemplateFields` struct. `encoding/json` emits struct fields in this
-/// order, so the `json` template function must serialize them the same way.
-const CANONICAL_ERROR_FIELDS: [&str; 7] = [
-    "message",
-    "filepath",
-    "line",
-    "column",
-    "kind",
-    "snippet",
-    "end_column",
+/// order, so the `json` template function must serialize them the same way. The map keys are the
+/// exported Go field names, since templates reach them as `{{.Filepath}}`; the `json` function
+/// lowers them back to the json tag names.
+const CANONICAL_ERROR_FIELDS: [(&str, &str); 7] = [
+    ("Message", "message"),
+    ("Filepath", "filepath"),
+    ("Line", "line"),
+    ("Column", "column"),
+    ("Kind", "kind"),
+    ("Snippet", "snippet"),
+    ("EndColumn", "end_column"),
 ];
 
 /// Converts a [`gtmpl::Value`] into a [`serde_json::Value`], applying the `omitempty` semantics of
@@ -385,8 +402,8 @@ fn gtmpl_to_json(v: &gtmpl::Value, omit_empty: bool) -> serde_json::Value {
             // HashMap with nondeterministic order, so walk the canonical field order explicitly
             // and insert each present field in that order (serde_json's `preserve_order` feature
             // keeps the resulting Map ordered).
-            for lower in CANONICAL_ERROR_FIELDS {
-                let Some(val) = o.get(lower) else {
+            for (exported, lower) in CANONICAL_ERROR_FIELDS {
+                let Some(val) = o.get(exported) else {
                     continue;
                 };
                 if omit_empty
@@ -444,23 +461,39 @@ fn get_version_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncE
     Ok(gtmpl::Value::String(env!("CARGO_PKG_VERSION").to_string()))
 }
 
-/// The `allKinds` template function: returns the list of registered rule kinds.
+/// The registry of rule kinds published by [`ErrorFormatter`] for the `allKinds` format helper.
+///
+/// `gtmpl` format helpers are plain function pointers with no access to the formatter, so the
+/// registered kinds are published through this process-global mirror (guarded by a mutex) that
+/// [`all_kinds_func`] reads at render time. Only one formatter renders per process, matching the
+/// original's single CLI process.
+static REGISTERED_KINDS: OnceLock<Mutex<BTreeMap<String, RuleTemplateFields>>> = OnceLock::new();
+
+/// Replaces the globally published rule kinds with the formatter's current set.
+fn set_registered_kinds(rules: &BTreeMap<String, RuleTemplateFields>) {
+    let registry = REGISTERED_KINDS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    *registry.lock().expect("kinds mutex poisoned") = rules.clone();
+}
+
+/// The `allKinds` template function: returns the list of registered rule kinds, sorted by name.
 fn all_kinds_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncError> {
+    let kinds: Vec<RuleTemplateFields> = match REGISTERED_KINDS.get() {
+        Some(registry) => {
+            let map = registry.lock().expect("kinds mutex poisoned");
+            map.values().cloned().collect()
+        }
+        None => Vec::new(),
+    };
     Ok(gtmpl::Value::Array(
-        all_rule_kinds()
+        kinds
             .into_iter()
             .map(|kind| {
                 gtmpl::Value::Object(
                     [
-                        ("Name".to_string(), gtmpl::Value::String(kind.name.into())),
-                        ("name".to_string(), gtmpl::Value::String(kind.name.into())),
+                        ("Name".to_string(), gtmpl::Value::String(kind.name)),
                         (
                             "Description".to_string(),
-                            gtmpl::Value::String(kind.description.into()),
-                        ),
-                        (
-                            "description".to_string(),
-                            gtmpl::Value::String(kind.description.into()),
+                            gtmpl::Value::String(kind.description),
                         ),
                     ]
                     .into_iter()
@@ -471,86 +504,22 @@ fn all_kinds_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncErr
     ))
 }
 
-/// The name and description of a rule, used to populate the `allKinds` format helper.
-struct RuleKind {
-    name: &'static str,
-    description: &'static str,
-}
-
-/// Collects the name and description of every built-in rule (plus the always-present
-/// `syntax-check`), sorted by name. This mirrors the original, which registers each rule with the
-/// error formatter so templates can look up rule kinds and their descriptions.
-fn all_rule_kinds() -> Vec<RuleKind> {
-    use crate::rule::Rule;
-    use std::sync::Arc;
-
-    // The `action` and `expression` rules share caches; the `workflow-call` rule shares a reusable
-    // workflow cache. They are constructed here only to read their metadata, so empty caches are
-    // sufficient and nothing is ever read from them.
-    let actions_cache = Arc::new(crate::action_metadata::LocalActionsCache::new(None));
-    let reusable_cache =
-        Arc::new(crate::reusable_workflow::LocalReusableWorkflowCache::new_null(None));
-
-    let rules: Vec<Box<dyn Rule>> = vec![
-        Box::new(crate::rule_action::RuleAction::new(actions_cache.clone())),
-        Box::new(crate::rule_credentials::RuleCredentials::new()),
-        Box::new(crate::rule_deprecated_commands::RuleDeprecatedCommands::new()),
-        Box::new(crate::rule_env_var::RuleEnvVar::new()),
-        Box::new(crate::rule_events::RuleEvents::new()),
-        Box::new(crate::rule_expression::RuleExpression::new(
-            actions_cache,
-            reusable_cache.clone(),
-        )),
-        Box::new(crate::rule_glob::RuleGlob::new()),
-        Box::new(crate::rule_id::RuleId::new()),
-        Box::new(crate::rule_if_cond::RuleIfCond::new()),
-        Box::new(crate::rule_job_needs::RuleJobNeeds::new()),
-        Box::new(crate::rule_matrix::RuleMatrix::new()),
-        Box::new(crate::rule_permissions::RulePermissions::new()),
-        Box::new(crate::rule_runner_label::RuleRunnerLabel::new()),
-        Box::new(crate::rule_shell_name::RuleShellName::new()),
-        Box::new(crate::rule_workflow_call::RuleWorkflowCall::new(
-            PathBuf::new(),
-            reusable_cache,
-        )),
-    ];
-
-    let mut kinds: Vec<RuleKind> = rules
-        .iter()
-        .map(|r| RuleKind {
-            name: r.name(),
-            description: r.description(),
-        })
-        .collect();
-    kinds.push(RuleKind {
-        name: "syntax-check",
-        description: "Checks for GitHub Actions workflow syntax",
-    });
-    kinds.sort_by(|a, b| a.name.cmp(b.name));
-    kinds
-}
-
 /// Converts an [`ErrorTemplateFields`] into a [`gtmpl::Value`] object.
 ///
-/// Each field is exposed under both its `PascalCase` name (for template field access such as
-/// `{{.Filepath}}`) and its lowercase json tag name (for the `json` function).
+/// Each field is exposed only under its exported `PascalCase` name, matching the original Go
+/// struct: `text/template` can only reach exported fields, so a lowercase access such as
+/// `{{.filepath}}` resolves to nothing. The `json` function reads these `PascalCase` keys and
+/// lowers them back to the json tag names.
 fn field_to_gtmpl(f: &ErrorTemplateFields) -> gtmpl::Value {
     use gtmpl::Value;
-    let pairs: [(&str, Value); 14] = [
+    let pairs: [(&str, Value); 7] = [
         ("Message", Value::String(f.message.clone())),
-        ("message", Value::String(f.message.clone())),
         ("Filepath", Value::String(f.filepath.clone())),
-        ("filepath", Value::String(f.filepath.clone())),
         ("Line", Value::Number((f.line as f64).into())),
-        ("line", Value::Number((f.line as f64).into())),
         ("Column", Value::Number((f.column as f64).into())),
-        ("column", Value::Number((f.column as f64).into())),
         ("Kind", Value::String(f.kind.clone())),
-        ("kind", Value::String(f.kind.clone())),
         ("Snippet", Value::String(f.snippet.clone())),
-        ("snippet", Value::String(f.snippet.clone())),
         ("EndColumn", Value::Number((f.end_column as f64).into())),
-        ("end_column", Value::Number((f.end_column as f64).into())),
     ];
     Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }

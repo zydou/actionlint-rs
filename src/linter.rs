@@ -144,21 +144,18 @@ impl<'a> Linter<'a> {
         self.lint_dir(&workflows, Some(project))
     }
 
-    /// Lints all YAML workflow files in the given directory.
+    /// Lints all YAML workflow files in the given directory, recursing into subdirectories.
+    ///
+    /// Mirrors the original `LintDir`, which walks the directory tree with `filepath.Walk` and
+    /// collects every `.yml` / `.yaml` file, so nested workflow files are checked too.
     pub fn lint_dir(
         &mut self,
         dir: &Path,
         project: Option<crate::project::Project>,
     ) -> Result<Vec<Error>, String> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| format!("could not read files in {}: {e}", dir.display()))?
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && matches!(p.extension().and_then(|e| e.to_str()), Some("yml" | "yaml"))
-            })
-            .collect();
+        let mut files = Vec::new();
+        collect_workflow_files(dir, &mut files)
+            .map_err(|e| format!("could not read files in {}: {e}", dir.display()))?;
         files.sort();
         if files.is_empty() {
             return Err(format!("no YAML file was found in {}", dir.display()));
@@ -167,17 +164,18 @@ impl<'a> Linter<'a> {
     }
 
     /// Lints the given YAML workflow files, printing each file's errors as they are checked.
+    ///
+    /// Mirrors the original `LintFiles`: every file is read up front, and if any read fails the
+    /// error is returned before anything is linted or printed (so stdout stays empty on failure).
     pub fn lint_files(
         &mut self,
         paths: &[PathBuf],
         project: Option<crate::project::Project>,
     ) -> Result<Vec<Error>, String> {
-        let mut all = Vec::new();
-        // In `--format` mode all errors are rendered through a single template invocation, so the
-        // template fields are accumulated across files and printed once at the end (matching the
-        // original `LintFiles`).
-        let mut fields = Vec::new();
-
+        // Phase 1: resolve each file's project and read its content. Any failure aborts before any
+        // output is produced, matching the original's `errgroup.Wait()` after all reads.
+        let mut contents: Vec<(PathBuf, String, Option<crate::project::Project>)> =
+            Vec::with_capacity(paths.len());
         for p in paths {
             let project = match &project {
                 Some(pr) => crate::project::find_project(p)?.or(Some(pr.clone())),
@@ -185,16 +183,31 @@ impl<'a> Linter<'a> {
             };
             let content =
                 std::fs::read(p).map_err(|e| format!("could not read {}: {e}", p.display()))?;
+            contents.push((
+                p.clone(),
+                String::from_utf8_lossy(&content).into_owned(),
+                project,
+            ));
+        }
+
+        // Phase 2: lint and print. All reads succeeded, so output flows normally.
+        let mut all = Vec::new();
+        // In `--format` mode all errors are rendered through a single template invocation, so the
+        // template fields are accumulated across files and printed once at the end (matching the
+        // original `LintFiles`).
+        let mut fields = Vec::new();
+
+        for (p, content, project) in &contents {
             let path_str = p.to_string_lossy().into_owned();
-            let errs = self.check(&path_str, &content, project.as_ref())?;
+            let errs = self.check(&path_str, content.as_bytes(), project.as_ref())?;
 
             if self.err_fmt.is_some() {
-                fields.extend(errs.iter().map(|e| e.template_fields(&content)));
+                fields.extend(errs.iter().map(|e| e.template_fields(content.as_bytes())));
             } else {
-                let src = if self.opts.oneline {
-                    &[][..]
+                let src: &[u8] = if self.opts.oneline {
+                    &[]
                 } else {
-                    &content[..]
+                    content.as_bytes()
                 };
                 for e in &errs {
                     e.pretty_print(&mut *self.out, src);
@@ -220,9 +233,15 @@ impl<'a> Linter<'a> {
         content: &[u8],
         project: Option<crate::project::Project>,
     ) -> Result<Vec<Error>, String> {
+        // The original only resolves a project when the path is a real file: `LintStdin` passes a
+        // nil project and a path of `<stdin>`, so a workflow piped on stdin is never attributed to
+        // the surrounding git project (which would otherwise enable project-relative rules such as
+        // `workflow-call`). A custom `-stdin-filename` still resolves a project, matching the
+        // original's literal `path != "<stdin>"` check.
         let project = match project {
             Some(p) => Some(p),
-            None => crate::project::find_project(Path::new(path))?,
+            None if path != "<stdin>" => crate::project::find_project(Path::new(path))?,
+            None => None,
         };
 
         let errs = self.check(path, content, project.as_ref())?;
@@ -259,7 +278,14 @@ impl<'a> Linter<'a> {
         let (workflow, mut all) = crate::parse::parse(content);
 
         if let Some(w) = workflow {
-            let errs = crate::linter::run_rules(&w, path, project, config.as_ref(), &self.opts)?;
+            let errs = crate::linter::run_rules(
+                &w,
+                path,
+                project,
+                config.as_ref(),
+                &self.opts,
+                self.err_fmt.as_ref(),
+            )?;
             all.extend(errs);
         }
 
@@ -297,6 +323,28 @@ impl<'a> Linter<'a> {
     }
 }
 
+/// Recursively collects every `.yml` / `.yaml` file under `dir`, mirroring the original's
+/// `filepath.Walk` in `LintDir`. Only regular files with a workflow extension are collected;
+/// subdirectories are traversed so nested workflow files are checked too.
+fn collect_workflow_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_workflow_files(&path, out)?;
+        } else if file_type.is_file()
+            && matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yml" | "yaml")
+            )
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// Runs all rules against the parsed workflow, returning the errors found by the rules (not
 /// including syntax errors). Each rule is given the resolved config via [`Rule::set_config`].
 ///
@@ -307,6 +355,7 @@ pub fn run_rules(
     project: Option<&crate::project::Project>,
     config: Option<&Config>,
     opts: &LinterOptions,
+    err_fmt: Option<&ErrorFormatter>,
 ) -> Result<Vec<Error>, String> {
     let mut visitor = crate::pass::Visitor::new();
     let mut rules: Vec<Box<dyn crate::rule::Rule>> = Vec::new();
@@ -382,5 +431,15 @@ pub fn run_rules(
     for r in &mut rules {
         all.append(&mut r.take_errors());
     }
+
+    // Register every rule that ran with the error formatter so the `allKinds` format helper exposes
+    // the full set of rule kinds (including the external `pyflakes` / `shellcheck` rules when they
+    // were enabled). This mirrors the original's `RegisterRule` loop after `Visit`.
+    if let Some(f) = err_fmt {
+        for r in &rules {
+            f.register_rule(r.as_ref());
+        }
+    }
+
     Ok(all)
 }
