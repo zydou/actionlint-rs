@@ -70,41 +70,35 @@ jobs:
           # silently targets whatever its own release defaults to (which floats with the zig
           # version) and can be newer than the 2.18 the project documents. `*-musl` targets are
           # fully static and need no pin.
-          #
-          # The only linux target that runs its tests: gnu is dynamically linked against the
-          # runner's own glibc, so it executes natively on the x86_64 runner.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             zig: true
             zig_target: x86_64-unknown-linux-gnu.2.18
-            test: true
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             zig: true
             zig_target: x86_64-unknown-linux-musl
-            test: false
-          # aarch64-linux is build-only: zigbuild has no QEMU, so an x86_64 runner cannot run
-          # the aarch64 test binary.
+          # The aarch64-linux targets build on a native arm64 runner (ubuntu-26.04-arm) rather than
+          # cross-compiling on x86_64. zigbuild still applies the gnu glibc pin, but it no longer
+          # needs QEMU — the runner's arch matches the target, so it builds natively AND can run the
+          # aarch64 test binary directly. That is why every target in this matrix sets no `test`
+          # flag: each one executes on a runner whose arch matches it, so all of them run tests.
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-26.04-arm
             zig: true
             zig_target: aarch64-unknown-linux-gnu.2.18
-            test: false
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-26.04-arm
             zig: true
             zig_target: aarch64-unknown-linux-musl
-            test: false
           # The darwin targets build natively on mac runners with plain cargo — no zig, since the
           # runner's arch already matches the target.
           - target: x86_64-apple-darwin
             runner: macos-26-intel
             zig: false
-            test: true
           - target: aarch64-apple-darwin
             runner: macos-latest
             zig: false
-            test: true
     steps:
       - uses: actions/checkout@v7
 
@@ -113,9 +107,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Linux targets cross-compile through cargo-zigbuild, which needs two pieces installed:
-      # the `zig` compiler (used as the linker/cross-libc provider) and the `cargo-zigbuild`
-      # wrapper that drives it. macOS builds natively with plain cargo and needs neither.
+      # The linux targets build through cargo-zigbuild, which needs two pieces installed: the `zig`
+      # compiler (linker/cross-libc provider) and the `cargo-zigbuild` wrapper that drives it. On
+      # the x86_64 runner it cross-compiles; on the arm64 runner it builds the matching-arch target
+      # natively (still applying the gnu glibc pin). macOS builds natively with plain cargo and
+      # needs neither.
       - name: Install zig
         if: ${{ matrix.zig }}
         uses: vercel-labs/setup-zig@v1
@@ -134,11 +130,10 @@ jobs:
 
       # Plain `cargo test`, not `cargo zigbuild test`: `cargo zigbuild` only wraps `cargo build`
       # (it drives zig as the linker for cross-compiling), and has no `test` subcommand. Every
-      # `test: true` target here runs natively on its runner — the gnu target on the x86_64 runner
-      # and both darwin targets on mac runners — so zig is not involved in testing at all.
-      # The build step below is where the gnu target's `.2.18` glibc pin is actually applied.
+      # target here runs on a runner whose arch matches it, so each tests natively and zig is not
+      # involved in testing at all. The build step below is where the gnu targets' `.2.18` glibc
+      # pin is actually applied.
       - name: Test ${{ matrix.target }}
-        if: ${{ matrix.test }}
         run: cargo test --locked --target ${{ matrix.target }}
 
       # Everything below is skipped on pull requests: they get the test signal above
