@@ -4,10 +4,10 @@
 //! workflow file. Errors can be pretty-printed with a source snippet, or rendered through a Go
 //! template via [`ErrorFormatter`].
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
 
 use colored::Colorize;
 use unicode_width::UnicodeWidthChar;
@@ -463,29 +463,30 @@ fn get_version_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncE
     Ok(gtmpl::Value::String(env!("CARGO_PKG_VERSION").to_string()))
 }
 
-/// The registry of rule kinds published by [`ErrorFormatter`] for the `allKinds` format helper.
-///
-/// `gtmpl` format helpers are plain function pointers with no access to the formatter, so the
-/// registered kinds are published through this process-global mirror (guarded by a mutex) that
-/// [`all_kinds_func`] reads at render time. Only one formatter renders per process, matching the
-/// original's single CLI process.
-static REGISTERED_KINDS: OnceLock<Mutex<BTreeMap<String, RuleTemplateFields>>> = OnceLock::new();
+// The registry of rule kinds published by `ErrorFormatter` for the `allKinds` format helper.
+//
+// `gtmpl` format helpers are plain function pointers with no access to the formatter, so the
+// registered kinds are published through a mirror that `all_kinds_func` reads at render time.
+// The mirror is thread-local rather than process-global: a lint run registers its rules and
+// renders on the same thread, so per-thread storage keeps each run's kinds isolated. A process
+// global would let concurrent formatters (unit tests run their lint lifecycles on separate
+// threads) overwrite each other's kinds mid-render, so `allKinds` could observe a partial or
+// reset set. The original never hits this because its CLI process renders exactly once.
+thread_local! {
+    static REGISTERED_KINDS: RefCell<BTreeMap<String, RuleTemplateFields>> = const { RefCell::new(BTreeMap::new()) };
+}
 
-/// Replaces the globally published rule kinds with the formatter's current set.
+/// Replaces the current thread's published rule kinds with the formatter's set.
 fn set_registered_kinds(rules: &BTreeMap<String, RuleTemplateFields>) {
-    let registry = REGISTERED_KINDS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    *registry.lock().expect("kinds mutex poisoned") = rules.clone();
+    REGISTERED_KINDS.with(|registry| {
+        *registry.borrow_mut() = rules.clone();
+    });
 }
 
 /// The `allKinds` template function: returns the list of registered rule kinds, sorted by name.
 fn all_kinds_func(_args: &[gtmpl::Value]) -> Result<gtmpl::Value, gtmpl::FuncError> {
-    let kinds: Vec<RuleTemplateFields> = match REGISTERED_KINDS.get() {
-        Some(registry) => {
-            let map = registry.lock().expect("kinds mutex poisoned");
-            map.values().cloned().collect()
-        }
-        None => Vec::new(),
-    };
+    let kinds: Vec<RuleTemplateFields> =
+        REGISTERED_KINDS.with(|registry| registry.borrow().values().cloned().collect());
     Ok(gtmpl::Value::Array(
         kinds
             .into_iter()
