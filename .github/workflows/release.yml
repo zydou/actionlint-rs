@@ -1,17 +1,25 @@
 ---
-# Release: one binary per (platform, ABI) pair, attached to the GitHub Release of the pushed tag.
+# Release pipeline: format check, static analysis, tests, then one binary per
+# (platform, ABI) pair attached to the GitHub Release of the pushed tag.
+
+# A single workflow gates a release on a green build: the `lint` and `test-*` jobs run on
+# every push, pull request, and dispatch, and the `build` job — which packages and publishes
+# the binaries — runs only after all of them pass. A pull request therefore gets the full
+# lint/test feedback loop but never publishes.
 
 # Linux targets go through cross-rs so the binary comes out of a fixed toolchain image instead of whatever the runner ships.
 # The macOS targets build natively — `x86_64-apple-darwin` on an Intel runner, `aarch64-apple-darwin` on the arm64 one.
 
 # Trigger: every push. A `v*` tag releases to that tag;
 # any branch push releases to `nightly`, so the latest main build is always published.
+# Pull requests run lint + tests only (the `build` job is event-gated) for fast feedback.
 # `workflow_dispatch` builds the checked-out ref and attaches it to the release named by the `release` input (default `nightly`)
 
 name: Release
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
     inputs:
       release:
@@ -30,12 +38,106 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CARGO_TERM_COLOR: always
   CARGO: cargo
+  RUSTFLAGS: -D warnings
   RUST_BACKTRACE: 1
 
 jobs:
+  lint:
+    # Format and static analysis are host-independent, so run them once.
+    name: fmt & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test-linux:
+    name: test (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The host target runs natively: fastest path to unit + integration tests.
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          # The required musl target runs through cross so it is tested, not just compiled.
+          - target: x86_64-unknown-linux-musl
+            cross: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Cross
+        if: ${{ matrix.cross }}
+        # The pre-built cross binary rather than `cargo install cross`, which spends ~5 min
+        # compiling a tool the job uses once.
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -L --proto '=https' --tlsv1.2 -sSf \
+            https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xzf - -C "$HOME/.cargo/bin"
+          echo "CARGO=cross" >> "$GITHUB_ENV"
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo test
+        run: ${{ env.CARGO }} test --locked --target ${{ matrix.target }}
+
+  test-macos:
+    name: test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-26-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo test
+        run: cargo test --locked --target ${{ matrix.target }}
+
   build:
+    # Publishes only once the code is known good: lint and every platform's tests must pass.
+    # Pull requests stop here — they get the checks above without publishing anything.
     name: ${{ matrix.target }}
+    needs: [lint, test-linux, test-macos]
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
