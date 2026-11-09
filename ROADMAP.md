@@ -6,6 +6,24 @@
 > 原项目路径：`~/Projects/actionlint`（禁止修改其代码）
 > 目标项目路径：`~/Projects/actionlint-rs`
 
+## 上游对齐基准
+
+本 Rust 移植版的功能对齐基准是上游 `rhysd/actionlint` 的一个固定 commit。上游会继续迭代，
+每次将 Rust 版重新对齐到新的上游 commit 时，在下方 re-sync 追踪表中追加一行即可沉淀历史。
+
+- **上游仓库**：https://github.com/rhysd/actionlint
+- **当前对齐 commit**：`011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7`（短 `011a6d15e749`）
+  - 提交标题：`Merge pull request #651 from attehuhtakangas/fix-shellcheck-deadlock-macos`
+- **确认方式**：运行上游二进制 `actionlint -version`，其伪版本串形如
+  `v1.7.13-0.<UTC时间戳>-<短commit>`，末尾的短 commit 即为对齐基准。
+- **本地路径**：`~/Projects/actionlint`（其 git `origin` 即上游仓库；禁止修改其代码）
+
+### re-sync 追踪表
+
+| 日期 | 上游 commit | 本仓库对齐 commit | 备注 |
+| ---- | ----------- | ----------------- | ---- |
+| 2026-11-09 | [`011a6d15e749`](https://github.com/rhysd/actionlint/tree/011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7) | 初始移植完成 | 首次记录基线；完成全部规则、CLI、格式化、项目定位的对齐并经 drop-in 兼容性审计修复 8 条差异 |
+
 ---
 
 ## 1. 原项目完整能力清单
