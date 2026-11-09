@@ -183,8 +183,13 @@ impl<'a> Linter<'a> {
             };
             let content =
                 std::fs::read(p).map_err(|e| format!("could not read {}: {e}", p.display()))?;
+            // Use the path relative to the current directory when possible, matching the original's
+            // `filepath.Rel(cwd, path)`. Error messages and `paths` config matching then use this
+            // relative path, so cwd-relative glob patterns apply regardless of how the file was
+            // passed (absolute path or discovered without arguments).
+            let rel = relativize_to_cwd(p);
             contents.push((
-                p.clone(),
+                PathBuf::from(rel),
                 String::from_utf8_lossy(&content).into_owned(),
                 project,
             ));
@@ -233,14 +238,17 @@ impl<'a> Linter<'a> {
         content: &[u8],
         project: Option<crate::project::Project>,
     ) -> Result<Vec<Error>, String> {
-        // The original only resolves a project when the path is a real file: `LintStdin` passes a
-        // nil project and a path of `<stdin>`, so a workflow piped on stdin is never attributed to
-        // the surrounding git project (which would otherwise enable project-relative rules such as
-        // `workflow-call`). A custom `-stdin-filename` still resolves a project, matching the
-        // original's literal `path != "<stdin>"` check.
+        // The original only resolves a project when the path is a real, existing file: `Lint` guards
+        // project detection with `path != "<stdin>"` AND `os.Stat(path)` succeeding. `LintStdin`
+        // passes a nil project, so a workflow piped on stdin is never attributed to the surrounding
+        // git project (which would otherwise enable project-relative rules such as `workflow-call`
+        // resolving local reusable workflows). A custom `-stdin-filename` that does not name a real
+        // file is likewise not attributed to a project, matching the original.
         let project = match project {
             Some(p) => Some(p),
-            None if path != "<stdin>" => crate::project::find_project(Path::new(path))?,
+            None if path != "<stdin>" && Path::new(path).exists() => {
+                crate::project::find_project(Path::new(path))?
+            }
             None => None,
         };
 
@@ -343,6 +351,27 @@ fn collect_workflow_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result
         }
     }
     Ok(())
+}
+
+/// Computes `path` relative to the current working directory, matching the original's use of
+/// `filepath.Rel(cwd, path)`. Already-relative paths are returned unchanged, and a path that cannot
+/// be made relative to the current directory (e.g. it lives outside it) falls back to its original
+/// form. This keeps error messages and `paths` config matching aligned with the original, which
+/// reports and matches against cwd-relative paths.
+fn relativize_to_cwd(path: &Path) -> String {
+    let display = path.to_string_lossy().into_owned();
+    let Ok(cwd) = std::env::current_dir() else {
+        return display;
+    };
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    match abs.strip_prefix(&cwd) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => display,
+    }
 }
 
 /// Runs all rules against the parsed workflow, returning the errors found by the rules (not

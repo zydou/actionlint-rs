@@ -180,8 +180,22 @@ Flags:
     }
 
     fn init_config(&mut self) -> Result<u8, u8> {
+        // Locate the project by walking up from the current directory, mirroring the original's
+        // `GenerateDefaultConfig` (which resolves the project before writing). This requires a Git
+        // repository with a `.github/workflows` directory, and writes the config to the project
+        // root — so running from a subdirectory targets the root, and a non-project fails without
+        // creating anything.
         let cwd = std::env::current_dir().map_err(|_| EXIT_STATUS_FAILURE)?;
-        let dir = cwd.join(".github");
+        let project = crate::project::find_project(&cwd).map_err(|_| EXIT_STATUS_FAILURE)?;
+        let Some(project) = project else {
+            let _ = writeln!(
+                self.stderr,
+                "project is not found. check current project is initialized as Git repository and \".github/workflows\" directory exists"
+            );
+            return Err(EXIT_STATUS_FAILURE);
+        };
+
+        let dir = project.root_dir().join(".github");
         for f in ["actionlint.yaml", "actionlint.yml"] {
             let p = dir.join(f);
             if p.exists() {

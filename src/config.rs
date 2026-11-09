@@ -3,7 +3,6 @@
 //! Rust counterpart of the original `config.go`. The configuration is read from an
 //! `actionlint.yaml` file usually placed in the `.github` directory.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use regex::Regex;
@@ -29,6 +28,20 @@ pub struct PathConfig {
     pub ignore: IgnorePatterns,
 }
 
+/// A [`PathConfig`] paired with the compiled matcher for its glob pattern. The matcher is built
+/// once during parsing so [`Config::path_configs`] can reuse it, and it uses `literal_separator`
+/// semantics so a single `*` does not match `/` (while `**` still spans directories), matching the
+/// original's use of `doublestar`.
+#[derive(Debug, Clone)]
+pub struct CompiledPathConfig {
+    /// The glob pattern as written in the config file.
+    pub pattern: String,
+    /// The compiled matcher for [`Self::pattern`].
+    pub matcher: globset::GlobMatcher,
+    /// The per-path configuration.
+    pub config: PathConfig,
+}
+
 /// The actionlint configuration, parsed from an `actionlint.yaml` file.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -37,9 +50,9 @@ pub struct Config {
     /// Names of configuration variables used in the checked workflows. When `None`, property
     /// names of the `vars` context are not checked. An empty list means no variable is allowed.
     pub config_variables: Option<Vec<String>>,
-    /// The `paths` mapping. Keys are glob patterns matching file paths, values are the
-    /// corresponding configurations.
-    pub paths: BTreeMap<String, PathConfig>,
+    /// The `paths` entries with their glob patterns compiled, in the order they appeared. Used by
+    /// [`Config::path_configs`] to match file paths.
+    pub compiled_paths: Vec<CompiledPathConfig>,
 }
 
 impl Config {
@@ -49,12 +62,9 @@ impl Config {
     pub fn path_configs(&self, path: &str) -> Vec<&PathConfig> {
         let path = path.replace('\\', "/");
         let mut ret = Vec::new();
-        for (pattern, config) in &self.paths {
-            // Glob patterns are validated during parsing, so matching cannot fail here.
-            if let Ok(m) = globset::Glob::new(pattern)
-                && m.compile_matcher().is_match(&path)
-            {
-                ret.push(config);
+        for compiled in &self.compiled_paths {
+            if compiled.matcher.is_match(&path) {
+                ret.push(&compiled.config);
             }
         }
         ret
@@ -66,7 +76,16 @@ impl Config {
 pub fn parse_config(b: &[u8]) -> Result<Config, String> {
     let text = std::str::from_utf8(b).map_err(|e| e.to_string())?;
     let docs = saphyr::Yaml::load_from_str(text).map_err(|e| e.to_string())?;
-    let doc = docs.into_iter().next().ok_or("config file is empty")?;
+    let Some(doc) = docs.into_iter().next() else {
+        // An empty (0-byte or whitespace-only) file unmarshals to the zero config in the original,
+        // which then lints normally. Treat it as an empty config rather than an error.
+        return Ok(Config::default());
+    };
+    // `null` is the zero value in the original's YAML unmarshalling, so it yields the default
+    // config. Any other non-mapping document (sequence, plain scalar) is a type error.
+    if matches!(doc, saphyr::Yaml::Value(saphyr::Scalar::Null)) {
+        return Ok(Config::default());
+    }
 
     let saphyr::Yaml::Mapping(mapping) = &doc else {
         return Err("config file must be a mapping".to_string());
@@ -135,16 +154,27 @@ fn parse_self_hosted_runner(v: &saphyr::Yaml<'_>, config: &mut Config) -> Result
 }
 
 fn parse_paths(v: &saphyr::Yaml<'_>, config: &mut Config) -> Result<(), String> {
-    let saphyr::Yaml::Mapping(mapping) = v else {
+    // `null` (e.g. `paths:` with the entries commented out) is the zero value in the original's
+    // YAML unmarshalling, yielding an empty mapping.
+    if matches!(v, saphyr::Yaml::Value(saphyr::Scalar::Null)) {
         return Ok(());
+    }
+    // The original unmarshals `paths` into a map, so a non-mapping value (e.g. `paths: 42`) is a
+    // type error rather than an empty mapping.
+    let saphyr::Yaml::Mapping(mapping) = v else {
+        return Err("paths must be a mapping node".to_string());
     };
     for (k, val) in mapping {
         let Some(pattern) = scalar_str(k) else {
             continue;
         };
-        if globset::Glob::new(&pattern).is_err() {
-            return Err(format!("invalid glob pattern {pattern:?} in \"paths\""));
-        }
+        // Validate the pattern (rejecting invalid globs) and compile a matcher that treats a single
+        // `*` as not crossing `/`, matching the original's `doublestar` semantics.
+        let matcher = globset::GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|_| format!("invalid glob pattern {pattern:?} in \"paths\""))?
+            .compile_matcher();
         let mut pc = PathConfig::default();
         if let saphyr::Yaml::Mapping(m) = val {
             for (ik, iv) in m {
@@ -161,22 +191,35 @@ fn parse_paths(v: &saphyr::Yaml<'_>, config: &mut Config) -> Result<(), String> 
                 }
             }
         }
-        config.paths.insert(pattern, pc);
+        config.compiled_paths.push(CompiledPathConfig {
+            pattern,
+            matcher,
+            config: pc,
+        });
     }
     Ok(())
 }
 
 fn parse_string_seq(v: &saphyr::Yaml<'_>) -> Result<Vec<String>, String> {
+    // The original unmarshals these fields into slices, so a non-sequence value (e.g. a plain
+    // string) is a type error rather than an empty list.
     let saphyr::Yaml::Sequence(seq) = v else {
-        return Ok(Vec::new());
+        return Err("expected a sequence node".to_string());
     };
+    // Non-string scalars (numbers, booleans) are coerced to their string form, matching the
+    // original's YAML unmarshalling into `[]string`.
     Ok(seq.iter().filter_map(scalar_str).collect())
 }
 
-/// Extracts a scalar string value from a YAML node, if it is one.
+/// Extracts a scalar string value from a YAML node, coercing non-string scalars (numbers,
+/// booleans) to their string form. This mirrors the original's YAML unmarshalling into `[]string`
+/// and string map keys, where a scalar such as `42` or `true` becomes `"42"` / `"true"`.
 fn scalar_str(v: &saphyr::Yaml<'_>) -> Option<String> {
     match v {
         saphyr::Yaml::Value(saphyr::Scalar::String(c)) => Some(c.to_string()),
+        saphyr::Yaml::Value(saphyr::Scalar::Boolean(b)) => Some(b.to_string()),
+        saphyr::Yaml::Value(saphyr::Scalar::Integer(i)) => Some(i.to_string()),
+        saphyr::Yaml::Value(saphyr::Scalar::FloatingPoint(f)) => Some(f.to_string()),
         saphyr::Yaml::Representation(c, _, _) => Some(c.to_string()),
         _ => None,
     }
@@ -275,10 +318,78 @@ paths:
     }
 
     #[test]
+    fn empty_config_is_default() {
+        // A 0-byte config unmarshals to the zero config in the original, which then lints normally.
+        let c = parse_config(b"").unwrap();
+        assert!(c.self_hosted_runner_labels.is_empty());
+        assert!(c.config_variables.is_none());
+        assert!(c.compiled_paths.is_empty());
+    }
+
+    #[test]
+    fn null_config_is_default() {
+        // A top-level `null` is the zero value in the original's YAML unmarshalling.
+        let c = parse_config(b"null").unwrap();
+        assert!(c.self_hosted_runner_labels.is_empty());
+        assert!(c.config_variables.is_none());
+        assert!(c.compiled_paths.is_empty());
+    }
+
+    #[test]
+    fn top_level_sequence_rejected() {
+        assert!(parse_config(b"- a\n- b\n").is_err());
+    }
+
+    #[test]
+    fn top_level_scalar_rejected() {
+        assert!(parse_config(b"hello").is_err());
+    }
+
+    #[test]
+    fn scalar_where_sequence_expected_rejected() {
+        // A plain string where a sequence is required is a type error, matching the original's
+        // strict unmarshalling into `[]string`.
+        assert!(parse_config(b"self-hosted-runner:\n  labels: \"foo\"\n").is_err());
+        assert!(parse_config(b"config-variables: \"foo\"\n").is_err());
+        assert!(
+            parse_config(b"paths:\n  '.github/workflows/*.yml':\n    ignore: \"x\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn paths_non_mapping_rejected() {
+        assert!(parse_config(b"paths: 42\n").is_err());
+    }
+
+    #[test]
+    fn integer_in_labels_coerced_to_string() {
+        // Non-string scalars inside a sequence are coerced to their string form, matching the
+        // original's unmarshalling into `[]string`.
+        let c = parse_config(b"self-hosted-runner:\n  labels: [42, true]\n").unwrap();
+        assert_eq!(
+            c.self_hosted_runner_labels,
+            vec!["42".to_string(), "true".to_string()]
+        );
+    }
+
+    #[test]
+    fn single_glob_does_not_cross_separator() {
+        // A single `*` must not match `/` (matching the original's `doublestar` semantics), so a
+        // top-level pattern does not apply to a nested workflow file.
+        let src = b"paths:\n  '.github/workflows/*.yml':\n    ignore: ['.']\n";
+        let c = parse_config(src).unwrap();
+        assert!(
+            c.path_configs(".github/workflows/sub/nested.yml")
+                .is_empty()
+        );
+        assert_eq!(c.path_configs(".github/workflows/ci.yml").len(), 1);
+    }
+
+    #[test]
     fn default_config_roundtrip() {
         let c = parse_config(DEFAULT_CONFIG.as_bytes()).unwrap();
         assert!(c.self_hosted_runner_labels.is_empty());
         assert!(c.config_variables.is_none());
-        assert!(c.paths.is_empty());
+        assert!(c.compiled_paths.is_empty());
     }
 }
